@@ -7,11 +7,11 @@ copilot plugin marketplace add SergeyTeplyakov/ManualReviewCanvas
 copilot plugin install manual-review-canvas@manual-review-canvas
 ```
 
-In the Copilot app, [open this link](ghapp://plugins/install?source=manual-review-canvas%40manual-review-canvas&marketplace=SergeyTeplyakov%2FManualReviewCanvas). It asks you to confirm adding the `SergeyTeplyakov/ManualReviewCanvas` marketplace and installing `manual-review-canvas@manual-review-canvas`, then opens the install form pre-filled. Click Install to finish.
+In the Copilot app, [install Manual Review Canvas](https://github.com/copilot/app/launch?open=ghapp%3A%2F%2Fplugins%2Finstall%3Fsource%3Dmanual-review-canvas%2540manual-review-canvas%26marketplace%3DSergeyTeplyakov%252FManualReviewCanvas). It asks you to confirm adding the `SergeyTeplyakov/ManualReviewCanvas` marketplace and installing `manual-review-canvas@manual-review-canvas`, then opens the install form pre-filled. Click Install to finish.
 
 Or do it by hand: **Customize → + Add → Marketplace** with `SergeyTeplyakov/ManualReviewCanvas`, then **+ Add → Plugin** with `manual-review-canvas@manual-review-canvas`.
 
-Start a new session in a repository with some changes and try:
+Start a new session in a repository with some changes and try a read-only review:
 
 ```text
 Open my changes against origin/main in the manual review canvas. Don't change anything until I comment.
