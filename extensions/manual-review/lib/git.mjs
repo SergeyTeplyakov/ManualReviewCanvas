@@ -75,13 +75,13 @@ async function readUntracked(repoRoot, relPath) {
     const result = await readRepoFile(repoRoot, relPath, MAX_UNTRACKED_BYTES);
     if (!result) return null;
     if (result.tooLarge) {
-        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], note: "File too large to display" };
+        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash, note: "File too large to display" };
     }
     const { buffer } = result;
     if (isBinary(buffer)) {
-        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [] };
+        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash };
     }
-    return synthesizeAddedFile(relPath, buffer.toString("utf8"));
+    return { ...synthesizeAddedFile(relPath, buffer.toString("utf8")), contentHash: result.contentHash };
 }
 
 // Read symlinks as Git does (their target text), never as the target's contents.
@@ -92,14 +92,28 @@ async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
     const parent = await realpath(path.dirname(full));
     const checked = safeJoin(root, path.relative(root, path.join(parent, path.basename(full))));
     const info = await lstat(checked);
-    if (info.isSymbolicLink()) return { buffer: Buffer.from(await readlink(checked)) };
+    if (info.isSymbolicLink()) {
+        const buffer = Buffer.from(await readlink(checked));
+        return { buffer, contentHash: createHash("sha256").update(buffer).digest("hex") };
+    }
     if (!info.isFile()) return null;
     const resolved = await realpath(checked);
     safeJoin(root, path.relative(root, resolved));
     const handle = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
-        if ((await handle.stat()).size > maxBytes) return { tooLarge: true };
-        return { buffer: await handle.readFile() };
+        if (!Number.isFinite(maxBytes)) return { buffer: await handle.readFile() };
+        const hash = createHash("sha256");
+        const chunks = [];
+        let size = 0;
+        // Hash every byte from the same safe handle; retain only display-sized files in memory.
+        for await (const chunk of handle.createReadStream({ autoClose: false })) {
+            hash.update(chunk);
+            size += chunk.length;
+            if (size <= maxBytes) chunks.push(chunk);
+            else chunks.length = 0;
+        }
+        const contentHash = hash.digest("hex");
+        return size > maxBytes ? { tooLarge: true, contentHash } : { buffer: Buffer.concat(chunks), contentHash };
     } finally {
         await handle.close();
     }

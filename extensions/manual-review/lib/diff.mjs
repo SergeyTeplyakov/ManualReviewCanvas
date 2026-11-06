@@ -79,7 +79,10 @@ export function parseUnifiedDiff(text) {
             }
         }
         if (line.startsWith("\\")) {
-            if (hunk) hunk.noNewlineAtEnd = true;
+            if (hunk?.rows.length) {
+                hunk.noNewlineAtEnd = true;
+                hunk.rows[hunk.rows.length - 1].noNewlineAtEnd = true;
+            }
             continue;
         }
 
@@ -115,9 +118,18 @@ export function parseUnifiedDiff(text) {
             continue;
         }
 
-        if (line.startsWith("new file mode")) file.status = "added";
-        else if (line.startsWith("deleted file mode")) file.status = "deleted";
-        else if (line.startsWith("rename from ")) {
+        if (line.startsWith("new file mode ")) {
+            file.status = "added";
+            file.newMode = line.slice("new file mode ".length);
+        } else if (line.startsWith("deleted file mode ")) {
+            file.status = "deleted";
+            file.oldMode = line.slice("deleted file mode ".length);
+        } else if (line.startsWith("old mode ")) file.oldMode = line.slice("old mode ".length);
+        else if (line.startsWith("new mode ")) file.newMode = line.slice("new mode ".length);
+        else if (/^index \S+ \d{6}$/.test(line)) {
+            if (file.status !== "added") file.oldMode = line.slice(-6);
+            if (file.status !== "deleted") file.newMode = line.slice(-6);
+        } else if (line.startsWith("rename from ")) {
             file.status = "renamed";
             file.oldPath = unquotePath(line.slice("rename from ".length));
         } else if (line.startsWith("rename to ")) {
@@ -138,7 +150,30 @@ export function parseUnifiedDiff(text) {
         if (!f.path) f.path = f.oldPath;
         if (f.status === "added") f.oldPath = null;
     }
-    return files;
+    // Git splits a type change (regular file <-> symlink) into a deletion and addition.
+    // Consumers identify files by path, so expose the complete replacement as one change.
+    const normalized = [];
+    const byPath = new Map();
+    for (const f of files) {
+        const previous = byPath.get(f.path);
+        if (previous?.status === "deleted" && f.status === "added") {
+            const rows = [...previous.hunks.flatMap((h) => h.rows), ...f.hunks.flatMap((h) => h.rows)];
+            const oldLines = previous.deletions;
+            const newLines = f.additions;
+            Object.assign(previous, {
+                status: "modified", typeChanged: true, newMode: f.newMode,
+                binary: previous.binary || f.binary, additions: newLines,
+                hunks: rows.length ? [{
+                    header: `@@ -${oldLines ? 1 : 0},${oldLines} +${newLines ? 1 : 0},${newLines} @@`,
+                    section: "", oldStart: oldLines ? 1 : 0, oldLines, newStart: newLines ? 1 : 0, newLines, rows,
+                }] : [],
+            });
+        } else {
+            normalized.push(f);
+            byPath.set(f.path, f);
+        }
+    }
+    return normalized;
 }
 
 // Builds an "added file" entry for an untracked file's content.
@@ -146,6 +181,7 @@ export function synthesizeAddedFile(relPath, content) {
     const lines = content.split("\n").map(stripCr);
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     const rows = lines.map((s, i) => ({ t: "add", o: null, n: i + 1, s }));
+    if (content && !content.endsWith("\n")) rows[rows.length - 1].noNewlineAtEnd = true;
     return {
         path: relPath,
         oldPath: null,
@@ -198,7 +234,9 @@ export function hunkExcerpt(file, side, startLine, endLine, maxRows = 60) {
         const pad = Math.max(3, Math.floor((maxRows - (lastIdx - idx + 1)) / 2));
         const from = Math.max(0, idx - pad);
         const to = Math.min(hunk.rows.length, lastIdx + pad + 1);
-        const body = hunk.rows.slice(from, to).map((r) => rowPrefix(r) + r.s);
+        const body = hunk.rows.slice(from, to).flatMap((r) => [
+            rowPrefix(r) + r.s, ...(r.noNewlineAtEnd ? ["\\ No newline at end of file"] : []),
+        ]);
         return { header: hunk.header, text: [hunk.header, ...body].join("\n") };
     }
     return null;

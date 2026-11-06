@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 
-const MARKER_RE = /\[manual-review mr:([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]/g;
+const MARKER_RE = /^\[manual-review mr:([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
 
 const nowIso = () => new Date().toISOString();
 
@@ -33,6 +33,7 @@ export class Delivery extends EventEmitter {
         this.seenSessionMessageIds = new Map();
         this.touched = new Set();
         this.inFlight = new Map();
+        this.lifecycle = Promise.resolve();
     }
 
     deliver(reviewId, threadId, messageId, instanceId, options = {}) {
@@ -46,7 +47,7 @@ export class Delivery extends EventEmitter {
 
     async deliverOnce(reviewId, threadId, messageId, instanceId, { retry = false } = {}) {
         this.touched.add(reviewId);
-        const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry });
+        const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
         if (!claim) return { delivered: false, skipped: true };
         return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId);
     }
@@ -54,7 +55,7 @@ export class Delivery extends EventEmitter {
     // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
     async submit(reviewId, instanceId) {
         this.touched.add(reviewId);
-        const claims = await this.service.claimDrafts(reviewId);
+        const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
         if (!claims.length) return { submitted: 0, delivered: false };
         const result = await this.sendClaimed(reviewId, claims, instanceId);
         return { submitted: claims.length, ...result };
@@ -111,12 +112,12 @@ export class Delivery extends EventEmitter {
             }, c);
         }
         // The user.message event can arrive before send() resolves, and its turn may already have finished.
-        const seen = sessionMessageId ? this.seenSessionMessageIds.get(sessionMessageId) : undefined;
-        if (seen) {
+        await this.enqueueLifecycle(async () => {
+            const seen = sessionMessageId ? this.seenSessionMessageIds.get(sessionMessageId) : undefined;
+            if (!seen) return;
             this.seenSessionMessageIds.delete(sessionMessageId);
-            const patch = seen.finished ? { ...this.processingPatch(), state: "no-reply" } : this.processingPatch();
-            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, patch, c);
-        }
+            for (const target of targets) await this.processTarget(target, sessionMessageId, seen.finished);
+        });
         return { delivered: true, sessionMessageId };
     }
 
@@ -125,33 +126,52 @@ export class Delivery extends EventEmitter {
         return this.sessionId() || this.fallbackOwner;
     }
 
-    processingPatch() {
-        return { state: "processing", processingAt: nowIso(), processedBy: this.owner() };
+    // The returned promise reports errors to the caller; a failed event must not block later events.
+    enqueueLifecycle(callback) {
+        const pending = this.lifecycle.then(callback);
+        this.lifecycle = pending.catch(() => {});
+        return pending;
     }
 
-    async onUserMessage(event) {
+    processTarget(target, sessionMessageId, finished = false) {
+        return this.service.processDelivery(target.reviewId, target.messageId, {
+            attemptId: target.attemptId, sessionMessageId, sessionId: this.owner(), finished,
+        });
+    }
+
+    onUserMessage(event) {
+        return this.enqueueLifecycle(() => this.handleUserMessage(event));
+    }
+
+    async handleUserMessage(event) {
         const data = event?.data ?? {};
         let targets = data.messageId ? this.bySessionMessageId.get(data.messageId) : undefined;
         if (!targets) {
-            const text = `${data.transformedContent ?? ""}\n${data.content ?? ""}`;
             const seen = new Set();
             targets = [];
-            for (const m of text.matchAll(MARKER_RE)) {
-                if (seen.has(m[2])) continue;
-                seen.add(m[2]);
-                targets.push({ reviewId: m[1], messageId: m[2] });
+            for (const text of [data.transformedContent, data.content]) {
+                for (const line of String(text ?? "").split(/\r?\n/)) {
+                    const m = MARKER_RE.exec(line);
+                    if (!m) break;
+                    if (seen.has(m[2])) continue;
+                    seen.add(m[2]);
+                    targets.push({ reviewId: m[1], messageId: m[2] });
+                }
             }
         }
-        if (!targets.length) {
+        let applied = false;
+        for (const target of targets) {
+            if (await this.processTarget(target, data.messageId)) {
+                this.touched.add(target.reviewId);
+                applied = true;
+            }
+        }
+        if (!applied) {
             if (data.messageId) {
                 this.seenSessionMessageIds.set(data.messageId, { finished: false });
                 if (this.seenSessionMessageIds.size > 200) this.seenSessionMessageIds.delete(this.seenSessionMessageIds.keys().next().value);
             }
             return;
-        }
-        for (const target of targets) {
-            this.touched.add(target.reviewId);
-            await this.service.setDelivery(target.reviewId, target.messageId, this.processingPatch(), target);
         }
     }
     setBusy(busy) {
@@ -160,7 +180,11 @@ export class Delivery extends EventEmitter {
         this.emit("session", { busy });
     }
 
-    async onIdle() {
+    onIdle() {
+        return this.enqueueLifecycle(() => this.handleIdle());
+    }
+
+    async handleIdle() {
         this.setBusy(false);
         for (const seen of this.seenSessionMessageIds.values()) seen.finished = true;
         const ids = new Set([...this.touched, ...this.reviewIds()]);

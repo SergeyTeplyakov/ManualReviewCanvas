@@ -35,9 +35,14 @@ const CASE_INSENSITIVE_HOST = /^(?:(?:ssh\.)?github\.com|[^.]+\.ghe\.com|gitlab\
 // A non-default port is kept, since it can name a different server.
 export function normalizeRemoteUrl(url) {
     let value = String(url ?? "").trim().replace(/\\/g, "/");
-    const scp = /^(?:[^@/\s]+@)?([^:/\s]{2,}):(?!\/\/)(.+)$/.exec(value);
+    const scp = /^(?:([^@/\s]+)@)?([^:/\s]{2,}):(?!\/\/)(.+)$/.exec(value);
     if (scp && !value.includes("://")) {
-        value = `${scp[1]}/${scp[2]}`;
+        const [, user, host, remotePath] = scp;
+        if (!CASE_INSENSITIVE_HOST.test(host.toLowerCase()) && !remotePath.startsWith("/")) {
+            // On generic SSH servers this path is relative to this particular user's home.
+            return `ssh-home:${user ?? ""}@${host.toLowerCase()}/${remotePath.replace(/\.git\/*$/i, "").replace(/\/+$/, "")}`;
+        }
+        value = `${host}/${remotePath.replace(/^\/+/, "")}`;
     } else {
         const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(value)?.[1].toLowerCase();
         value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/^[^@/]*@/, "");

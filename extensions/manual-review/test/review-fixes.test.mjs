@@ -8,7 +8,8 @@ import path from "node:path";
 import { Store } from "../lib/store.mjs";
 import { ReviewService } from "../lib/review-service.mjs";
 import { Delivery } from "../lib/delivery.mjs";
-import { parseUnifiedDiff } from "../lib/diff.mjs";
+import { hunkExcerpt, parseUnifiedDiff } from "../lib/diff.mjs";
+import { normalizeRemoteUrl, SettingsService } from "../lib/settings.mjs";
 import { relocate } from "../lib/anchors.mjs";
 import { captureSnapshot, readWorkingFile, runGit, safeJoin } from "../lib/git.mjs";
 
@@ -415,4 +416,173 @@ test("the snapshot fingerprint changes when an untracked file becomes binary or 
     await writeFile(file, Buffer.alloc(2 * 1024 * 1024 + 1, 0x61));
     const tooLarge = await fingerprint();
     assert.equal(new Set([empty, binary, tooLarge]).size, 3);
+});
+
+test("quoted and forged delivery markers cannot release drafts or transfer another session's attempt", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const draft = await service.createThread(id, { kind: "overview", body: "Private draft", hold: true });
+    const sent = await service.createThread(id, { kind: "overview", body: "Submitted comment" });
+    const marker = (m) => `[manual-review mr:${id}:${m.message.messageId}]`;
+    const a = new Delivery({ service, sessionId: () => "a", send: async () => "transport-a" });
+    await a.deliver(id, sent.thread.threadId, sent.message.messageId, "inst");
+    const b = new Delivery({ service, sessionId: () => "b", send: async () => "transport-b" });
+    await a.onUserMessage({ data: { messageId: "quote", content: `Quoted log:\n${marker(draft)}\n${marker(sent)}` } });
+    await a.onUserMessage({ data: { messageId: "forged", content: marker(draft) } });
+    await b.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
+    const state = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    assert.equal((await state(draft)).state, "draft");
+    assert.equal((await state(sent)).state, "queued");
+    assert.doesNotMatch(JSON.stringify(service.summarize(await service.getReview(id))), /Private draft/);
+
+    // A restarted provider can recognize only its own persisted transport and current attempt.
+    const resumed = new Delivery({ service: new ReviewService({ store: new Store(store.root) }), sessionId: () => "a", send: async () => "unused" });
+    await resumed.onUserMessage({ data: { messageId: "wrong-transport", content: marker(sent) } });
+    assert.equal((await state(sent)).state, "queued");
+    await resumed.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
+    assert.equal((await state(sent)).processedBy, "a");
+    await b.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
+    assert.equal((await state(sent)).processedBy, "a");
+    await resumed.onIdle();
+    const oldAttempt = (await state(sent)).attemptId;
+    await service.claimDelivery(id, sent.thread.threadId, sent.message.messageId, { retry: true, senderSessionId: "a" });
+    assert.equal(await service.processDelivery(id, sent.message.messageId, { attemptId: oldAttempt, sessionMessageId: "transport-a", sessionId: "a" }), false);
+    await resumed.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
+    assert.equal((await state(sent)).state, "saving", "an old marker cannot process a new attempt");
+});
+
+test("legacy queued attempts require their exact transport event to establish the processing owner", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const { thread, message } = await service.createThread(id, { kind: "overview", body: "Sent before upgrading" });
+    const claim = await service.claimDelivery(id, thread.threadId, message.messageId);
+    await service.setDelivery(id, message.messageId, { state: "queued", sessionMessageId: "legacy" }, claim);
+    const delivery = new Delivery({ service: new ReviewService({ store }), sessionId: () => "owner", send: async () => "unused" });
+    const content = `[manual-review mr:${id}:${message.messageId}]`;
+    await delivery.onUserMessage({ data: { messageId: "quoted", content } });
+    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "queued");
+    await delivery.onUserMessage({ data: { messageId: "legacy", content } });
+    await delivery.onIdle();
+    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "no-reply");
+});
+
+test("idle waits for every preceding batch processing update, including delayed persistence", async (t) => {
+    const { repo, service } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const comments = [];
+    for (let i = 0; i < 3; i++) comments.push(await service.createThread(id, { kind: "overview", body: `Comment ${i}`, hold: true }));
+    const delivery = new Delivery({ service, send: async () => "batch", sessionId: () => "owner" });
+    await delivery.submit(id, "inst");
+    let release, reached;
+    const paused = new Promise((resolve) => { reached = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    const processDelivery = service.processDelivery.bind(service);
+    let calls = 0;
+    service.processDelivery = async (...args) => {
+        const result = await processDelivery(...args);
+        if (++calls === 1) { reached(); await gate; }
+        return result;
+    };
+    const processing = delivery.onUserMessage({ data: { messageId: "batch" } });
+    await paused;
+    const idle = delivery.onIdle();
+    release();
+    await Promise.all([processing, idle]);
+    for (const c of comments) {
+        assert.equal((await service.findMessage(id, c.message.messageId)).message.delivery.state, "no-reply");
+    }
+});
+
+test("newline-only changes retain the affected row in snapshots, excerpts and full-file validation", async (t) => {
+    const { repo, service } = await fixture(t);
+    await writeFile(path.join(repo, "eof.txt"), "same");
+    await git(repo, "add", "eof.txt");
+    await git(repo, "commit", "-q", "-m", "without newline");
+    await writeFile(path.join(repo, "eof.txt"), "same\n");
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const snapshot = await service.store.readSnapshot(id, "r1");
+    const file = snapshot.files.find((f) => f.path === "eof.txt");
+    assert.deepEqual(file.hunks[0].rows.map((r) => [r.t, r.s, !!r.noNewlineAtEnd]), [["del", "same", true], ["add", "same", false]]);
+    assert.match(hunkExcerpt(file, "new", 1, 1).text, /-same\n\\ No newline at end of file\n\+same/);
+    assert.equal((await service.getFileContent(id, "r1", "eof.txt")).available, true);
+    await writeFile(path.join(repo, "eof.txt"), "same");
+    assert.equal((await service.getFileContent(id, "r1", "eof.txt")).reason, "stale");
+    await writeFile(path.join(repo, "eof.txt"), "same\n");
+    await git(repo, "add", "eof.txt");
+    await git(repo, "commit", "-q", "-m", "with newline");
+    await writeFile(path.join(repo, "eof.txt"), "same");
+    const removed = (await captureSnapshot({ repoRoot: repo, scope: "pending" })).files.find((f) => f.path === "eof.txt");
+    assert.deepEqual(removed.hunks[0].rows.map((r) => [r.t, !!r.noNewlineAtEnd]), [["del", false], ["add", true]]);
+});
+
+test("file-to-symlink replacement is one navigable file with both sides available for anchors", async (t) => {
+    const { repo, service } = await fixture(t);
+    await git(repo, "config", "core.symlinks", "true");
+    await rm(path.join(repo, "a.txt"));
+    await symlink("target.txt", path.join(repo, "a.txt"), "file");
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const snapshot = await service.store.readSnapshot(id, "r1");
+    const files = snapshot.files.filter((f) => f.path === "a.txt");
+    assert.equal(files.length, 1);
+    assert.deepEqual([files[0].oldMode, files[0].newMode, files[0].typeChanged], ["100644", "120000", true]);
+    assert.deepEqual((await service.getFileContent(id, "r1", "a.txt")).lines, ["target.txt"]);
+    for (const side of ["old", "new"]) {
+        const { thread } = await service.createThread(id, { kind: "line", path: "a.txt", side, startLine: 1, body: side });
+        assert.deepEqual(thread.anchor.selectedLines, [side === "old" ? "line 1" : "target.txt"]);
+    }
+    await git(repo, "add", "a.txt");
+    await git(repo, "commit", "-q", "-m", "symlink");
+    await rm(path.join(repo, "a.txt"));
+    await writeFile(path.join(repo, "a.txt"), "regular again\n");
+    const reversed = (await captureSnapshot({ repoRoot: repo, scope: "pending" })).files;
+    assert.equal(reversed.length, 1);
+    assert.deepEqual([reversed[0].oldMode, reversed[0].newMode, reversed[0].hunks[0].rows.at(-1).s], ["120000", "100644", "regular again"]);
+});
+
+test("mode-only changes preserve old and new permissions and reach file-comment prompts", async (t) => {
+    const { repo, service } = await fixture(t);
+    await git(repo, "config", "core.filemode", "false");
+    await writeFile(path.join(repo, "run.sh"), "echo ok\n");
+    await git(repo, "add", "run.sh");
+    await git(repo, "commit", "-q", "-m", "script");
+    await git(repo, "update-index", "--chmod=+x", "run.sh");
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const file = (await service.store.readSnapshot(id, "r1")).files.find((f) => f.path === "run.sh");
+    assert.deepEqual([file.oldMode, file.newMode, file.hunks.length], ["100644", "100755", 0]);
+    const { thread } = await service.createThread(id, { kind: "file", path: "run.sh", body: "Why executable?" });
+    assert.equal((await service.promptContext(id, thread.threadId)).excerpt.text, "File mode: 100644 to 100755");
+});
+
+test("raw content fingerprints change within binary and oversized classifications and for final newlines", async (t) => {
+    const { repo, service } = await fixture(t);
+    const target = path.join(repo, "untracked.dat");
+    const fingerprints = [];
+    let id;
+    for (const data of [Buffer.from([0, 1]), Buffer.from([0, 2]), Buffer.alloc(2 * 1024 * 1024 + 1, 65), Buffer.alloc(2 * 1024 * 1024 + 1, 66), "text", "text\n"]) {
+        await writeFile(target, data);
+        if (!id) id = await service.ensureReview({ repoPath: repo, base: "main" });
+        else await service.refresh(id);
+        const review = await service.getReview(id);
+        const snapshot = await service.store.readSnapshot(id, review.currentRevisionId);
+        fingerprints.push(snapshot.fingerprint);
+        const file = snapshot.files.find((f) => f.path === "untracked.dat");
+        assert.equal(file.contentHash, createHash("sha256").update(data).digest("hex"));
+    }
+    assert.equal(new Set(fingerprints).size, 6);
+    assert.equal((await service.getReview(id)).revisions.length, 6);
+});
+
+test("generic SSH home paths keep their user and never share automatic learning with absolute paths", async (t) => {
+    const home = "git@host.example:team/repo.git";
+    const absolute = "ssh://git@host.example/team/repo.git";
+    assert.notEqual(normalizeRemoteUrl(home), normalizeRemoteUrl(absolute));
+    assert.notEqual(normalizeRemoteUrl(home), normalizeRemoteUrl("other@host.example:team/repo.git"));
+    assert.equal(normalizeRemoteUrl("git@host.example:/team/repo.git"), normalizeRemoteUrl(absolute));
+    assert.equal(normalizeRemoteUrl("git@github.com:Owner/Repo.git"), normalizeRemoteUrl("ssh://git@github.com/Owner/Repo.git"));
+    const { repo, store } = await fixture(t);
+    let url = home;
+    const settings = new SettingsService({ store, git: { runGit: async () => ({ ok: true, stdout: url }) } });
+    await settings.update(repo, { learning: "auto", delivery: "batch" });
+    url = absolute;
+    assert.deepEqual([(await settings.get(repo)).learning, (await settings.get(repo)).delivery], ["off", "immediate"]);
 });

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
+import { parseUnifiedDiff } from "../lib/diff.mjs";
 
 // Loads the page script into a bare vm context. Elements are created on demand and remembered per selector,
 // so a test can render one piece of the page and read its markup back.
@@ -49,6 +50,25 @@ const clicker = (app) => (action, dataset = {}) => {
 test("the page provides every container the scope and learning controls render into", async () => {
     const html = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
     for (const id of ["top", "banner", "layout", "side", "main", "ruler", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
+});
+
+test("file views show mode changes and side-specific EOF notes without selectable phantom lines", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    const diff = "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 100755\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n";
+    const [file] = parseUnifiedDiff(diff);
+    app.state.files = [file];
+    const html = app.run(`fileView(${JSON.stringify(file)}, { stacked: true })`);
+    assert.match(html, /File mode: 100644 to 100755/);
+    assert.match(html, /class="eof-note".*No newline at end of file \(old side\)/);
+    assert.equal((html.match(/<tr class="row /g) ?? []).length, 2);
+    const note = html.match(/<tr class="eof-note">.*?<\/tr>/)[0];
+    assert.doesNotMatch(note, /data-h=|data-i=/, "EOF metadata does not change source row indices or selection");
+    file.hunks[0].rows[0].noNewlineAtEnd = false;
+    file.hunks[0].rows[1].noNewlineAtEnd = true;
+    assert.match(app.run(`fileView(${JSON.stringify(file)}, { stacked: true })`), /No newline at end of file \(new side\)/);
+    file.hunks = [];
+    assert.match(app.run(`fileView(${JSON.stringify(file)}, { stacked: true })`), /File mode: 100644 to 100755/);
 });
 
 test("the top bar shows the review scope, and the learning controls only when the settings are known", async () => {

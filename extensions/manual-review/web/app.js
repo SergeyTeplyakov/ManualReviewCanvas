@@ -1145,6 +1145,9 @@ function fileView(file, { stacked = false, folded = false } = {}) {
         return html.join("");
     }
     html.push((placed.get("file") ?? []).map((t) => threadHtml(t)).join(""));
+    if (file.oldMode !== file.newMode && (file.oldMode || file.newMode)) {
+        html.push(`<div class="card muted">File mode: ${esc(file.oldMode ?? "(absent)")} to ${esc(file.newMode ?? "(absent)")}${file.typeChanged ? " (file type changed)" : ""}</div>`);
+    }
     if (state.open.has(fileKey) || getDraft(fileKey) || state.pending.has(fileKey)) {
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
@@ -1186,6 +1189,10 @@ function fileView(file, { stacked = false, folded = false } = {}) {
             html.push(`<tr class="row ${row.t}${selected ? " sel" : ""}${hl ? " hl" : ""}" data-h="${h}" data-i="${i}">`
                 + `<td class="ln">${row.o ?? ""}</td><td class="ln">${row.n ?? ""}</td><td class="gut"><span>+</span></td>`
                 + `<td class="code" data-p="${prefix}">${syntax[h][i]}</td></tr>`);
+            if (row.noNewlineAtEnd) {
+                const side = row.t === "del" ? "old side" : row.t === "add" ? "new side" : "both sides";
+                html.push(`<tr class="eof-note"><td colspan="3"></td><td>\\ No newline at end of file (${side})</td></tr>`);
+            }
             const rowThreads = placed.get(`r${h}:${i}`) ?? [];
             const composerHere = sel && !state.dragging && sel.hunk === h && sel.to === i;
             if (rowThreads.length || composerHere) {

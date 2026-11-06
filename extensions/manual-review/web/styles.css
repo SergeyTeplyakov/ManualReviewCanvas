@@ -363,6 +363,7 @@ td.code .md-html, td.code .md-lang { color: var(--mr-syn-type); }
 /* background-image layers the fence tint over the add, delete, and selection colors. */
 tr.row td.code:has(> .md-block) { background-image: linear-gradient(var(--mr-md-block-bg), var(--mr-md-block-bg)); }
 tr.row.hl td.code { box-shadow: inset 3px 0 0 var(--mr-accent); }
+tr.eof-note td { color: var(--mr-code-muted); background: var(--mr-bg); font-style: italic; }
 tr.inline > td { padding: 6px 10px 8px 90px; background: var(--mr-bg); border-top: 1px solid var(--mr-border); border-bottom: 1px solid var(--mr-border); }
 .hunk-threads { padding: 6px 10px; border-bottom: 1px solid var(--mr-border); }
 

@@ -485,7 +485,12 @@ export class ReviewService extends EventEmitter {
 
         const lines = await this.git.readWorkingFile(review.repoRoot, filePath);
         if (!lines) return { ...base, available: false, reason: "missing", stale: true };
+        const endsWithNewline = lines[lines.length - 1] === "";
         if (lines[lines.length - 1] === "") lines.pop();
+        const finalRow = file.hunks.flatMap((h) => h.rows).find((r) => r.n === lines.length);
+        if (finalRow && Boolean(finalRow.noNewlineAtEnd) === endsWithNewline) {
+            return { ...base, available: false, reason: "stale", stale: true };
+        }
         if (lines.length > MAX_FULL_FILE_LINES) return { ...base, available: false, reason: "too-large" };
         const oldLines = file.status === "added"
             ? []
@@ -665,7 +670,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Claim before doing any async prompt work or sending; only one provider may send an attempt.
-    async claimDelivery(reviewId, threadId, messageId, { retry = false } = {}) {
+    async claimDelivery(reviewId, threadId, messageId, { retry = false, senderSessionId } = {}) {
         const claim = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const message = findThread(review, threadId).messages.find((m) => m.messageId === messageId);
@@ -674,7 +679,7 @@ export class ReviewService extends EventEmitter {
             const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
             if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state))) return { write: false, value: null };
             const attempt = { attemptId: randomUUID(), attempts: (current.attempts ?? 0) + 1 };
-            message.delivery = { state: "saving", ...attempt, claimPid: this.pid, error: null, updatedAt: nowIso() };
+            message.delivery = { state: "saving", ...attempt, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
             return { review, value: attempt };
         });
         if (claim) this.changed(reviewId, "delivery");
@@ -682,7 +687,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Claims every draft in one atomic update so a submitted review is sent once, as one batch.
-    async claimDrafts(reviewId) {
+    async claimDrafts(reviewId, { senderSessionId } = {}) {
         const claims = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft");
@@ -690,7 +695,7 @@ export class ReviewService extends EventEmitter {
             const batchId = randomUUID();
             const value = drafts.map(({ thread, message }) => {
                 const attempt = { attemptId: randomUUID(), attempts: (message.delivery.attempts ?? 0) + 1 };
-                message.delivery = { state: "saving", ...attempt, batchId, claimPid: this.pid, error: null, updatedAt: nowIso() };
+                message.delivery = { state: "saving", ...attempt, batchId, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
                 return { threadId: thread.threadId, messageId: message.messageId, ...attempt };
             });
             return { review, value };
@@ -732,6 +737,28 @@ export class ReviewService extends EventEmitter {
         });
         this.changed(reviewId, "message");
         return result;
+    }
+
+    // A marker is only a lookup hint, never permission to release a draft or transfer processing ownership.
+    async processDelivery(reviewId, messageId, { attemptId, sessionMessageId, sessionId, finished = false }) {
+        const applied = await this.store.updateReview(reviewId, (review) => {
+            const current = review && allMessages(review).find((e) => e.message.messageId === messageId)?.message.delivery;
+            // Older queued attempts have no sender field. Only their exact persisted transport event
+            // may establish one; a marker by itself (including while saving) cannot do so.
+            const legacyQueued = !current?.senderSessionId && current?.state === "queued"
+                && sessionMessageId && current.sessionMessageId === sessionMessageId;
+            if (!current?.attemptId || !sessionId || (!legacyQueued && current.senderSessionId !== sessionId)
+                || !["saving", "queued", "processing"].includes(current.state)
+                || (current.processedBy && current.processedBy !== sessionId)
+                || (attemptId ? current.attemptId !== attemptId : !sessionMessageId || current.sessionMessageId !== sessionMessageId)
+                || (current.sessionMessageId && current.sessionMessageId !== sessionMessageId)) {
+                return { write: false, value: false };
+            }
+            Object.assign(current, { state: finished ? "no-reply" : "processing", senderSessionId: sessionId, processedBy: sessionId, processingAt: nowIso(), updatedAt: nowIso() });
+            return { review, value: true };
+        });
+        if (applied) this.changed(reviewId, "delivery");
+        return applied;
     }
 
     // Applies a delivery transition; later states win within the claimed attempt.
@@ -821,6 +848,13 @@ export class ReviewService extends EventEmitter {
                     ? await this.git.readCommitFile(review.repoRoot, snapshot?.baseCommit, thread.anchor.oldPath ?? loc.path)
                     : await this.revisionLines(reviewId, loc.revisionId, loc.path);
                 selected = content ? content.slice(loc.startLine - 1, loc.endLine) : selected;
+            }
+        }
+        if (loc && thread.kind === "file") {
+            const snapshot = await this.store.readSnapshot(reviewId, loc.revisionId);
+            const file = snapshot?.files.find((f) => f.path === loc.path);
+            if (file && file.oldMode !== file.newMode && (file.oldMode || file.newMode)) {
+                excerpt = { text: `File mode: ${file.oldMode ?? "(absent)"} to ${file.newMode ?? "(absent)"}` };
             }
         }
         return {
