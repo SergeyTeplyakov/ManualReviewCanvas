@@ -445,6 +445,8 @@ test("syntax highlighting escapes source, preserves text, and recognizes code an
     }
     assert.equal(vm.runInContext('syntaxLanguage("Settings.xml")', context), "xml");
     assert.equal(vm.runInContext('syntaxLanguage("workflow.YAML")', context), "yaml");
+    assert.equal(vm.runInContext('syntaxLanguage("README.md")', context), "markdown");
+    assert.equal(vm.runInContext('syntaxLanguage("notes.MARKDOWN")', context), "markdown");
     assert.equal(vm.runInContext('syntaxLanguage("notes.txt")', context), null);
 });
 
@@ -480,6 +482,86 @@ test("multiline syntax state stays separate for old and new sides and resets ove
     assert.match(vm.runInContext('highlightLine("end --> <Node />", "xml", lex)', context), /syn-comment">end --&gt;<\/span> <span class="syn-keyword">&lt;Node/);
 });
 
+test("markdown highlighting keeps every marker visible and styles inline content", async () => {
+    const context = vm.createContext({
+        URLSearchParams, location: { search: "" },
+        document: { addEventListener() {}, querySelector: () => ({}) },
+        localStorage: { getItem: () => null }, setInterval() {},
+    });
+    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    vm.runInContext("var mdState = {}", context);
+    const highlight = (text) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, "markdown", mdState)`, context);
+    const escape = (text) => text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const heading = highlight("## Setup `npm` **now** ##");
+    assert.match(heading, /^<span class="md-mark">##<\/span><span class="md-heading"> Setup <span class="md-code"><span class="md-mark">`<\/span>npm<span class="md-mark">`<\/span><\/span>/);
+    assert.match(heading, /md-strong"><span class="md-mark">\*\*<\/span>now<span class="md-mark">\*\*<\/span>/);
+    assert.match(heading, /<span class="md-mark"> ##<\/span>$/);
+    assert.doesNotMatch(highlight("#hashtag"), /md-heading/);
+    const inline = highlight("Use **bold**, *it*, _em_ and ~~old~~ with `a`` b`.");
+    assert.match(inline, /md-strong"><span class="md-mark">\*\*<\/span>bold/);
+    assert.match(inline, /md-em"><span class="md-mark">\*<\/span>it/);
+    assert.match(inline, /md-em"><span class="md-mark">_<\/span>em/);
+    assert.match(inline, /md-del"><span class="md-mark">~~<\/span>old/);
+    assert.match(inline, /md-code"><span class="md-mark">`<\/span>a`` b<span class="md-mark">`/);
+    for (const plain of ["snake_case_name and 2 * 3 * 4", "\\*literal\\* and \\[x](y)", "a | b"]) assert.equal(highlight(plain), escape(plain));
+    const links = highlight('[docs](https://x.y/a_(b) "T"), ![logo](p.png), [text][id], <https://a.b> and https://c.d/e.');
+    assert.match(links, /md-mark">\[<\/span><span class="md-link">docs<\/span><span class="md-mark">\]\(<\/span><span class="md-url">https:\/\/x\.y\/a_\(b\)<\/span>/);
+    assert.match(links, /md-mark">!\[<\/span><span class="md-link">logo/);
+    assert.match(links, /md-link">text<\/span><span class="md-mark">\]\[<\/span><span class="md-url">id/);
+    assert.match(links, /md-mark">&lt;<\/span><span class="md-url">https:\/\/a\.b<\/span>/);
+    assert.match(links, /md-url">https:\/\/c\.d\/e<\/span>\.$/);
+    assert.match(highlight("- [x] done"), /^<span class="md-list">-<\/span> <span class="md-mark">\[x\]<\/span> done$/);
+    assert.match(highlight("12) item"), /^<span class="md-list">12\)<\/span>/);
+    assert.match(highlight("> **bold** quote"), /^<span class="md-mark">&gt; <\/span><span class="md-quote"><span class="md-strong">/);
+    assert.equal(highlight("| a | `b|c` |").match(/md-mark">\|/g).length, 3);
+    assert.equal(highlight("|---|:--:|"), '<span class="md-mark">|---|:--:|</span>');
+    assert.match(highlight('[id]: https://example.com "Title"'), /md-link">\[id\]:<\/span> <span class="md-url">https:\/\/example\.com/);
+    assert.equal(highlight("***"), '<span class="md-mark">***</span>');
+    const html = highlight("<script>alert(1)</script>");
+    assert.match(html, /md-html">&lt;script&gt;/);
+    assert.doesNotMatch(html, /<script>/);
+    assert.match(highlight("text <!-- start"), /syn-comment">&lt;!-- start/);
+    assert.match(highlight("end --> **after**"), /^<span class="syn-comment">end --&gt;<\/span> <span class="md-strong">/);
+    for (const source of [
+        "## Setup `npm` **now** ##", "**a *b* c** and __init__", '[x](https://y "z") <b>&</b>', "> - [ ] `q` ~~r~~",
+        "| a | `b|c` |", "`unclosed **text", "**unclosed and ![alt", "<!-- note --> 'quoted'",
+    ]) {
+        assert.equal(vm.runInContext(`highlightLine(${JSON.stringify(source)}, "markdown")`, context).replace(/<\/?span\b[^>]*>/g, ""), escape(source));
+    }
+});
+
+test("markdown fenced blocks highlight known languages, tint their rows, and reset over missing context", async () => {
+    const context = vm.createContext({
+        URLSearchParams, location: { search: "" },
+        document: { addEventListener() {}, querySelector: () => ({}) },
+        localStorage: { getItem: () => null }, setInterval() {},
+    });
+    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    vm.runInContext(`
+        var mdFile = { path: "docs/README.md", hunks: [
+            { rows: [
+                { t: "ctx", o: 1, n: 1, s: "\`\`\`javascript" },
+                { t: "add", o: null, n: 2, s: "const x = 1; // **not bold**" },
+                { t: "ctx", o: 2, n: 3, s: "\`\`\`" },
+                { t: "ctx", o: 3, n: 4, s: "**after**" },
+                { t: "add", o: null, n: 5, s: "~~~text" },
+                { t: "add", o: null, n: 6, s: "**plain**" },
+            ] },
+            { rows: [{ t: "ctx", o: 20, n: 21, s: "**bold**" }] },
+        ] };
+        var mdRows = highlightFile(mdFile);
+    `, context);
+    const rows = JSON.parse(vm.runInContext("JSON.stringify(mdRows)", context));
+    assert.equal(rows[0][0], '<span class="md-block"><span class="md-mark">```</span><span class="md-lang">javascript</span></span>');
+    assert.match(rows[0][1], /^<span class="md-block"><span class="syn-keyword">const<\/span>/);
+    assert.match(rows[0][1], /syn-comment">\/\/ \*\*not bold\*\*/);
+    assert.equal(rows[0][2], '<span class="md-block"><span class="md-mark">```</span></span>');
+    assert.match(rows[0][3], /^<span class="md-strong">/);
+    assert.match(rows[0][4], /md-lang">text/);
+    assert.equal(rows[0][5], '<span class="md-block">**plain**</span>');
+    assert.match(rows[1][0], /^<span class="md-strong">/);
+});
+
 test("syntax and line-number colors retain WCAG AA contrast on light and dark diff backgrounds", async () => {
     const css = await readFile(new URL("../web/styles.css", import.meta.url), "utf8");
     assert.match(css, /td\.code\s*\{[^}]*color:\s*var\(--mr-code-fg\)/, "plain source must not inherit green/red statistics colors");
@@ -494,9 +576,15 @@ test("syntax and line-number colors retain WCAG AA contrast on light and dark di
         return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
     };
     const themes = css.split("@media (prefers-color-scheme: dark)");
+    const overlays = [...css.matchAll(/--mr-md-[\w-]+-bg:\s*rgba\(127,\s*127,\s*127,\s*([\d.]+)\);/g)].map((m) => Number(m[1]));
+    assert.equal(overlays.length, 2, "markdown code and fence tints must stay neutral overlays");
+    const blend = (hex, alpha) => `#${hex.match(/[\da-f]{2}/gi).map((part) => Math.round(parseInt(part, 16) * (1 - alpha) + 127 * alpha).toString(16).padStart(2, "0")).join("")}`;
     for (const [index, section] of themes.entries()) {
         const colors = Object.fromEntries([...section.matchAll(/--mr-([\w-]+):\s*(#[\da-f]{6});/gi)].map((m) => [m[1], m[2]]));
-        const backgrounds = [index ? "#0d1117" : "#ffffff", colors["add-bg"], colors["del-bg"], colors["sel-bg"], colors["add-gutter"], colors["del-gutter"]];
+        // Markdown tints only appear inside code cells, never over the line-number gutters.
+        const backgrounds = [index ? "#0d1117" : "#ffffff", colors["add-bg"], colors["del-bg"], colors["sel-bg"]]
+            .flatMap((bg) => [bg, ...overlays.map((alpha) => blend(bg, alpha))])
+            .concat(colors["add-gutter"], colors["del-gutter"]);
         const foregrounds = Object.entries(colors).filter(([name]) => name.startsWith("syn-") || name === "code-fg" || name === "code-muted");
         for (const [name, color] of foregrounds) {
             for (const bg of backgrounds) {

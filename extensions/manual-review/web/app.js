@@ -62,12 +62,14 @@ function syntaxLanguage(filePath) {
     if (["xml", "html", "htm", "csproj", "props", "targets", "config", "svg", "xaml"].includes(ext)) return "xml";
     if (["json", "jsonc"].includes(ext)) return "json";
     if (["yaml", "yml"].includes(ext)) return "yaml";
+    if (["md", "markdown", "mdx"].includes(ext)) return "markdown";
     return null;
 }
 
 // Lexical highlighting only: escape every source fragment and preserve its exact text.
 function highlightLine(text, language, lexical = {}) {
     if (!language) return esc(text);
+    if (language === "markdown") return highlightMarkdown(text, lexical);
     const out = [];
     const emit = (value, kind) => out.push(kind ? `<span class="syn-${kind}">${esc(value)}</span>` : esc(value));
     const tokens = language === "xml"
@@ -117,6 +119,135 @@ function highlightLine(text, language, lexical = {}) {
             emit(token, kind);
         }
     }
+    return out.join("");
+}
+
+const MD_FENCE_ALIASES = { javascript: "js", typescript: "ts", csharp: "cs", "c#": "cs", "c++": "cpp", markdown: "md" };
+const MD_INLINE = /\\[!-\/:-@[-`{-~]|`+|<!--|!?\[|<(?:https?:\/\/|mailto:)[^<>\s]+>|(?<![\w/])https?:\/\/[^\s<>]*[^\s<>.,;:!?'")\]]|<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>|\*\*|__|~~|[*_|]/g;
+const MD_LINK = /!?\[((?:\\.|[^\\\]\n])*)\](?:\(([^()\s]*(?:\([^()\s]*\)[^()\s]*)*)((?:\s+(?:"[^"]*"|'[^']*'))?\s*)\)|\[([^\]\n]*)\])/y;
+const MD_STYLES = { "**": "strong", __: "strong", "*": "em", _: "em", "~~": "del" };
+const mdToken = (value, cls) => (value ? `<span class="${cls}">${esc(value)}</span>` : "");
+const mdBlock = (html) => `<span class="md-block">${html}</span>`;
+
+function fenceLanguage(info) {
+    const name = info.trim().split(/[\s{,]/)[0].toLowerCase();
+    return name ? syntaxLanguage(`fence.${MD_FENCE_ALIASES[name] ?? name}`) : null;
+}
+
+// Markdown stays source text: markers are dimmed, never removed, so selections and anchors match the file.
+function highlightMarkdown(text, lexical) {
+    const fence = lexical.fence;
+    if (fence) {
+        const close = text.match(/^(\s*)(`{3,}|~{3,})(\s*)$/);
+        if (close && close[2][0] === fence.marker[0] && close[2].length >= fence.marker.length) {
+            lexical.fence = null;
+            return mdBlock(esc(close[1]) + mdToken(close[2], "md-mark") + esc(close[3]));
+        }
+        return mdBlock(fence.language ? highlightLine(text, fence.language, fence.lexical) : esc(text));
+    }
+    if (lexical.comment) {
+        const end = text.indexOf("-->");
+        if (end < 0) return mdToken(text, "syn-comment");
+        lexical.comment = null;
+        return mdToken(text.slice(0, end + 3), "syn-comment") + mdInline(text.slice(end + 3), lexical);
+    }
+    const open = text.match(/^(\s*)(`{3,}|~{3,})(.*)$/);
+    if (open && !(open[2][0] === "`" && open[3].includes("`"))) {
+        lexical.fence = { marker: open[2], language: fenceLanguage(open[3]), lexical: {} };
+        return mdBlock(esc(open[1]) + mdToken(open[2], "md-mark") + mdToken(open[3], "md-lang"));
+    }
+    if (/^ {0,3}(?:([-*_])(?:[ \t]*\1){2,}|=+)[ \t]*$/.test(text)) return mdToken(text, "md-mark");
+    const heading = text.match(/^( {0,3})(#{1,6})((?:\s.*?)?)((?:\s#+)?\s*)$/);
+    if (heading) {
+        return esc(heading[1]) + mdToken(heading[2], "md-mark")
+            + `<span class="md-heading">${mdInline(heading[3], lexical)}</span>` + mdToken(heading[4], "md-mark");
+    }
+    const definition = text.match(/^( {0,3})(\[(?!\^)[^\]\n]+\]:)(\s*)(\S*)(.*)$/);
+    if (definition) {
+        return esc(definition[1]) + mdToken(definition[2], "md-link") + esc(definition[3])
+            + mdToken(definition[4], "md-url") + mdToken(definition[5], "md-mark");
+    }
+    let prefix = "";
+    let rest = text;
+    const quote = rest.match(/^ {0,3}>(?:[ \t]?>)*[ \t]?/);
+    if (quote) {
+        prefix += mdToken(quote[0], "md-mark");
+        rest = rest.slice(quote[0].length);
+    }
+    const item = rest.match(/^(\s*)([-*+]|\d{1,9}[.)])(?=\s|$)(\s*)(\[[ xX]\](?=\s|$))?/);
+    if (item) {
+        prefix += esc(item[1]) + mdToken(item[2], "md-list") + esc(item[3]) + mdToken(item[4], "md-mark");
+        rest = rest.slice(item[0].length);
+    }
+    if (/^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/.test(rest)) return prefix + mdToken(rest, "md-mark");
+    const body = mdInline(rest, lexical, /^\s*\|/.test(rest));
+    return prefix + (quote ? `<span class="md-quote">${body}</span>` : body);
+}
+
+function mdInline(text, lexical, table = false, depth = 0) {
+    // Delimiter matching rescans the line, so pathological lines stay plain.
+    if (depth > 6 || text.length > 4000) return esc(text);
+    const tokens = new RegExp(MD_INLINE);
+    const out = [];
+    let plain = 0;
+    let match;
+    while ((match = tokens.exec(text))) {
+        const token = match[0];
+        if (token[0] === "\\") continue;
+        const at = match.index;
+        let end = tokens.lastIndex;
+        let html = null;
+        if (token[0] === "`") {
+            const closing = /`+/g;
+            closing.lastIndex = end;
+            let close;
+            while ((close = closing.exec(text)) && close[0].length !== token.length);
+            if (close) {
+                html = `<span class="md-code">${mdToken(token, "md-mark")}${esc(text.slice(end, close.index))}${mdToken(close[0], "md-mark")}</span>`;
+                end = closing.lastIndex;
+            }
+        } else if (token === "<!--") {
+            const close = text.indexOf("-->", end);
+            if (close < 0) lexical.comment = "-->";
+            end = close < 0 ? text.length : close + 3;
+            html = mdToken(text.slice(at, end), "syn-comment");
+        } else if (token.endsWith("[")) {
+            MD_LINK.lastIndex = at;
+            const link = MD_LINK.exec(text);
+            if (link) {
+                const [, label, url, title, ref] = link;
+                end = MD_LINK.lastIndex;
+                const head = `${mdToken(token, "md-mark")}<span class="md-link">${mdInline(label, {}, false, depth + 1)}</span>`;
+                html = url != null
+                    ? `${head}${mdToken("](", "md-mark")}${mdToken(url, "md-url")}${mdToken(title, "md-mark")}${mdToken(")", "md-mark")}`
+                    : `${head}${mdToken("][", "md-mark")}${mdToken(ref, "md-url")}${mdToken("]", "md-mark")}`;
+            }
+        } else if (/^<(?:https?:|mailto:)/.test(token)) {
+            html = `${mdToken("<", "md-mark")}${mdToken(token.slice(1, -1), "md-url")}${mdToken(">", "md-mark")}`;
+        } else if (token.startsWith("<")) {
+            html = mdToken(token, "md-html");
+        } else if (token.startsWith("http")) {
+            html = mdToken(token, "md-url");
+        } else if (token === "|") {
+            if (table) html = mdToken(token, "md-mark");
+        } else {
+            const mark = token[0];
+            if (mark === "_" && /[\p{L}\p{N}]/u.test(text[at - 1] ?? "")) continue;
+            const c = mark === "*" ? "\\*" : mark;
+            const closing = new RegExp(`(?=[^\\s${c}])(.*?[^\\s\\\\${c}])${c.repeat(token.length)}(?!${c})${mark === "_" ? "(?![\\p{L}\\p{N}])" : ""}`, "uy");
+            closing.lastIndex = end;
+            const close = closing.exec(text);
+            if (close) {
+                end = closing.lastIndex;
+                html = `<span class="md-${MD_STYLES[token]}">${mdToken(token, "md-mark")}${mdInline(close[1], {}, table, depth + 1)}${mdToken(token, "md-mark")}</span>`;
+            }
+        }
+        if (html == null) continue;
+        if (at > plain) out.push(esc(text.slice(plain, at)));
+        out.push(html);
+        plain = tokens.lastIndex = end;
+    }
+    if (plain < text.length) out.push(esc(text.slice(plain)));
     return out.join("");
 }
 

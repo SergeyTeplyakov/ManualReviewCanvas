@@ -24,6 +24,8 @@
     --mr-syn-type: #084f58;
     --mr-syn-property: #743b16;
     --mr-subtle: rgba(127, 127, 127, 0.08);
+    --mr-md-code-bg: rgba(127, 127, 127, 0.18);
+    --mr-md-block-bg: rgba(127, 127, 127, 0.1);
     --mr-radius: 6px;
 }
 
@@ -347,6 +349,19 @@ td.code .syn-number { color: var(--mr-syn-number); }
 td.code .syn-comment { color: var(--mr-syn-comment); font-style: normal; }
 td.code .syn-type { color: var(--mr-syn-type); }
 td.code .syn-property { color: var(--mr-syn-property); }
+/* Markdown keeps every source character; styling only distinguishes markers from content. */
+td.code .md-mark, td.code .md-url { color: var(--mr-code-muted); }
+td.code .md-heading { color: var(--mr-syn-keyword); font-weight: 700; }
+td.code .md-strong { font-weight: 700; }
+td.code .md-em { font-style: italic; }
+td.code .md-del { text-decoration: line-through; }
+td.code .md-code { color: var(--mr-syn-property); background: var(--mr-md-code-bg); border-radius: 3px; }
+td.code .md-link { color: var(--mr-syn-string); text-decoration: underline; text-underline-offset: 2px; }
+td.code .md-list { color: var(--mr-syn-number); font-weight: 700; }
+td.code .md-quote { color: var(--mr-syn-comment); }
+td.code .md-html, td.code .md-lang { color: var(--mr-syn-type); }
+/* background-image layers the fence tint over the add, delete, and selection colors. */
+tr.row td.code:has(> .md-block) { background-image: linear-gradient(var(--mr-md-block-bg), var(--mr-md-block-bg)); }
 tr.row.hl td.code { box-shadow: inset 3px 0 0 var(--mr-accent); }
 tr.inline > td { padding: 6px 10px 8px 90px; background: var(--mr-bg); border-top: 1px solid var(--mr-border); border-bottom: 1px solid var(--mr-border); }
 .hunk-threads { padding: 6px 10px; border-bottom: 1px solid var(--mr-border); }

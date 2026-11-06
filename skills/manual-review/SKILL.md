@@ -56,7 +56,8 @@ thread. This is not an autonomous code-review pipeline.
    when the working tree no longer matches the revision.
    Use distinct, high-contrast addition/deletion backgrounds and local syntax
    highlighting in both views; respect the app theme, and preserve exact source
-   text and line selection.
+   text and line selection. Markdown keeps every marker visible and only styles
+   the content around it.
    Keep source comments upright. Show an overview ruler beside the scrollbar
    marking additions, deletions, and comment threads; clicking a marker scrolls
    to that location.
