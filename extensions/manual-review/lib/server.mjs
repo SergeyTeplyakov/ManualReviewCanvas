@@ -7,6 +7,7 @@ import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { SCOPES } from "./review-service.mjs";
+import { resolveDelivery } from "./settings.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const STATIC = {
@@ -146,6 +147,17 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
     }
 
+    // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
+    async function shouldHold(reviewId, draft) {
+        if (draft !== undefined) {
+            if (typeof draft !== "boolean") throw new HttpError(400, "invalid_input", "draft must be a boolean.");
+            return draft;
+        }
+        if (!settings) return false;
+        const review = await service.getReview(reviewId);
+        return resolveDelivery((await readSettings(review.repoRoot))?.delivery, review) !== "immediate";
+    }
+
     async function api(req, res, url) {
         const provided = req.headers["x-mr-token"] ?? (req.method === "GET" ? url.searchParams.get("t") : null);
         if (!tokenMatches(token, provided)) throw new HttpError(403, "forbidden", "Invalid token.");
@@ -187,14 +199,16 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const body = await readJsonBody(req);
 
         if (parts[0] === "threads" && parts.length === 1) {
-            const { thread, message, duplicate } = await service.createThread(reviewId, { ...body, author: "user" });
-            if (!duplicate) deliverAsync(reviewId, thread.threadId, message.messageId);
-            return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate });
+            const hold = await shouldHold(reviewId, body.draft);
+            const { thread, message, duplicate } = await service.createThread(reviewId, { ...body, author: "user", hold });
+            if (!duplicate && !hold) deliverAsync(reviewId, thread.threadId, message.messageId);
+            return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "messages") {
-            const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user" });
-            if (!duplicate) deliverAsync(reviewId, thread.threadId, message.messageId);
-            return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate });
+            const hold = await shouldHold(reviewId, body.draft);
+            const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
+            if (!duplicate && !hold) deliverAsync(reviewId, thread.threadId, message.messageId);
+            return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "status") {
             const thread = await service.setThreadStatus(reviewId, parts[1], body.status);
@@ -206,13 +220,35 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             const result = await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId, { retry: true });
             return send(res, 200, result);
         }
+        if (parts[0] === "messages" && parts.length === 3 && parts[2] === "send") {
+            const { thread, message } = await service.findMessage(reviewId, parts[1]);
+            if (message.author !== "user" || message.delivery?.state !== "draft") {
+                throw new HttpError(409, "conflict", "Only draft comments can be sent individually.");
+            }
+            return send(res, 200, await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId));
+        }
+        if (parts[0] === "messages" && parts.length === 3 && parts[2] === "discard") {
+            return send(res, 200, await service.discardDraft(reviewId, parts[1]));
+        }
+        if (parts[0] === "submit" && parts.length === 1) {
+            return send(res, 200, await delivery.submit(reviewId, instanceId));
+        }
+        if (parts[0] === "delivery" && parts.length === 1) {
+            if (body.mode !== null && body.mode !== "immediate" && body.mode !== "batch") {
+                throw new HttpError(400, "invalid_input", "mode must be immediate, batch, or null.");
+            }
+            const mode = await service.setDeliveryChoice(reviewId, body.mode);
+            // Choosing immediate sends whatever was held while the review was undecided.
+            const submitted = mode === "immediate" ? (await delivery.submit(reviewId, instanceId)).submitted : 0;
+            return send(res, 200, { mode, submitted });
+        }
         if (parts[0] === "refresh" && parts.length === 1) {
             return send(res, 200, await service.refresh(reviewId));
         }
         if (parts[0] === "settings" && parts.length === 1) {
             if (!settings) throw new HttpError(501, "unsupported", "Settings are not available.");
             const review = await service.getReview(reviewId);
-            return send(res, 200, await settings.update(review.repoRoot, { learning: body.learning, dismissed: body.dismissed }));
+            return send(res, 200, await settings.update(review.repoRoot, { learning: body.learning, delivery: body.delivery, dismissed: body.dismissed }));
         }
         if (parts[0] === "scope" && parts.length === 1) {
             if (!SCOPES.includes(body.scope)) throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);

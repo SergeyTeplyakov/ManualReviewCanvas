@@ -20,8 +20,9 @@ const state = {
     fileFold: new Map(), // path -> folded, for files stacked in a folder view
     content: new Map(), // `${revisionId}:${path}` -> full-file load state for the file view
     settings: null, // per-repository settings from the server; null hides the learning controls
-    dialog: null, // open Configure dialog: { learning, saving, error }
+    dialog: null, // open Configure dialog: { learning, delivery, saving, error }
     switching: false, // a scope switch is in flight
+    submitting: false, // a review submission is in flight
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
@@ -32,6 +33,12 @@ const LEARNING = {
     suggest: { label: "Suggest", pill: "Suggest", hint: "Copilot proposes a guideline in the thread when your feedback reveals a reusable rule, and saves it only after you approve." },
     auto: { label: "Save automatically", pill: "Auto-save", hint: "Copilot saves settled guidelines to the repository's instruction files and tells you where. Personal rules still wait for your confirmation." },
 };
+const DELIVERY_MODES = ["immediate", "batch", "ask"];
+const DELIVERY = {
+    immediate: { label: "Send each comment now", pill: "Immediate", hint: "Each comment goes to Copilot as soon as you post it." },
+    batch: { label: "Batch into a review", pill: "Batch", hint: "Comments wait as drafts until you submit the review, then Copilot addresses them together in one pass." },
+    ask: { label: "Ask for each review", pill: "Ask", hint: "The first time you comment on a review, choose whether to send each comment now or batch them." },
+};
 const LESSON_STATUSES = {
     proposed: "Proposed by Copilot and not saved yet. Approve it in the thread to save it.",
     saved: "Saved as a guideline for future work.",
@@ -40,6 +47,16 @@ const LESSON_STATUSES = {
 const scopeOf = (review) => (review?.scope === "pending" ? "pending" : "all");
 const scopeLabel = (scope) => (scope === "pending" ? "pending changes" : "all changes");
 const learningMode = () => (LEARNING_MODES.includes(state.settings?.learning) ? state.settings.learning : "off");
+const deliveryRepoMode = () => (DELIVERY_MODES.includes(state.settings?.delivery) ? state.settings.delivery : "immediate");
+// Mirrors the server's resolveDelivery: null while an ask-mode review is undecided. Without settings nothing is held.
+function deliveryMode() {
+    if (!state.settings) return "immediate";
+    const mode = deliveryRepoMode();
+    if (mode !== "ask") return mode;
+    const chosen = state.review?.deliveryMode;
+    return chosen === "immediate" || chosen === "batch" ? chosen : null;
+}
+const draftMessages = () => (state.review?.threads ?? []).flatMap((t) => t.messages).filter((m) => m.author === "user" && m.delivery?.state === "draft");
 // Lessons recorded before statuses existed were saved by definition.
 const lessonStatus = (lesson) => (Object.hasOwn(LESSON_STATUSES, lesson.status) ? lesson.status : "saved");
 const lessonBadge = (lesson) => {
@@ -672,23 +689,46 @@ function renderTop() {
     else if (state.busy === true) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     parts.push(`<span class="spacer"></span>`);
+    const drafts = draftMessages().length;
+    if (drafts) {
+        parts.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
+    }
     if (state.settings) {
+        const repoMode = deliveryRepoMode();
+        const chosen = repoMode === "ask" ? deliveryMode() : null;
+        parts.push(chosen
+            ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
+            : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
         const mode = LEARNING[learningMode()];
-        parts.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Choose how Copilot learns from your review feedback in this repository">Configure</button>`);
+        parts.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Choose how Copilot receives and learns from your review feedback in this repository">Configure</button>`);
     }
     parts.push(`<button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
     $("#top").innerHTML = parts.join("");
 }
 
-// ---------- Learning setting: first-use banner and Configure dialog ----------
+// ---------- Repository settings: first-use banner, per-review delivery question, and Configure dialog ----------
 
-function bannerHtml() {
+function learningBannerHtml() {
     const s = state.settings;
     if (!s || s.configured || s.dismissed) return "";
     const choice = (mode, primary) => `<button data-action="learning-set" data-mode="${mode}"${primary ? ` class="primary"` : ""} title="${esc(LEARNING[mode].hint)}">${esc(LEARNING[mode].label)}</button>`;
-    return `<span class="banner-text"><strong>Learn from your review feedback in ${esc(s.repoName)}?</strong> Copilot can turn your comments into reusable coding guidelines. The choice is stored on this machine only, and Configure changes it any time.</span>`
+    return `<div class="banner-row"><span class="banner-text"><strong>Learn from your review feedback in ${esc(s.repoName)}?</strong> Copilot can turn your comments into reusable coding guidelines. The choice is stored on this machine only, and Configure changes it any time.</span>`
         + `<span class="banner-actions">${choice("suggest", true)}${choice("auto", false)}`
-        + `<button class="link" data-action="learning-dismiss" title="Hide this notice. Learning stays off until you choose a mode with Configure.">Not now</button></span>`;
+        + `<button class="link" data-action="learning-dismiss" title="Hide this notice. Learning stays off until you choose a mode with Configure.">Not now</button></span></div>`;
+}
+
+// Shown while an ask-mode review is undecided; until then the server holds new comments as drafts.
+function deliveryBannerHtml() {
+    if (!state.settings || !state.review || deliveryRepoMode() !== "ask" || deliveryMode()) return "";
+    const drafts = draftMessages().length;
+    const waiting = drafts ? `${drafts} draft ${drafts === 1 ? "comment is" : "comments are"} waiting.` : "Until you choose, new comments wait as drafts.";
+    const choice = (mode, label) => `<button data-action="delivery-choose" data-mode="${mode}" title="${esc(DELIVERY[mode].hint)}">${label}</button>`;
+    return `<div class="banner-row"><span class="banner-text"><strong>How should Copilot receive your comments on this review?</strong> Send each one as you post it, or batch them and submit the review when you are done. ${waiting}</span>`
+        + `<span class="banner-actions">${choice("immediate", "Send each now")}${choice("batch", "Batch into a review")}</span></div>`;
+}
+
+function bannerHtml() {
+    return learningBannerHtml() + deliveryBannerHtml();
 }
 
 function renderBanner() {
@@ -698,15 +738,19 @@ function renderBanner() {
     el.innerHTML = html;
 }
 
+function choicesHtml(name, modes, table, selected) {
+    return modes.map((mode) => `<label class="choice"><input type="radio" name="${name}" value="${mode}"${selected === mode ? " checked" : ""}>`
+        + `<span><span class="choice-title">${esc(table[mode].label)}</span><span class="choice-hint">${esc(table[mode].hint)}</span></span></label>`).join("");
+}
+
 function dialogHtml() {
     const d = state.dialog;
     if (!d) return "";
-    const choices = LEARNING_MODES.map((mode) => `<label class="choice"><input type="radio" name="learning" value="${mode}"${d.learning === mode ? " checked" : ""}>`
-        + `<span><span class="choice-title">${esc(LEARNING[mode].label)}</span><span class="choice-hint">${esc(LEARNING[mode].hint)}</span></span></label>`).join("");
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Learn from review feedback</h2>`
-        + `<p id="dialog-desc" class="muted">Setting for ${esc(state.settings?.repoName ?? "this repository")}. It is stored on this machine only and never committed.</p>`
-        + `<fieldset class="choices"><legend class="sr-only">Learning mode</legend>${choices}</fieldset>`
+        + `<h2 id="dialog-title">Review settings</h2>`
+        + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
+        + `<fieldset class="choices"><legend>Learn from review feedback</legend>${choicesHtml("learning", LEARNING_MODES, LEARNING, d.learning)}</fieldset>`
+        + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
         + `<button class="primary" data-action="dialog-save"${d.saving ? " disabled" : ""}>${d.saving ? "Saving…" : "Save"}</button></div>`
@@ -728,7 +772,7 @@ function renderDialog() {
 
 function openConfigure() {
     if (!state.settings || state.dialog) return;
-    state.dialog = { learning: learningMode(), saving: false, error: "" };
+    state.dialog = { learning: learningMode(), delivery: deliveryRepoMode(), saving: false, error: "" };
     renderDialog();
     focusIn('#dialog input[name="learning"]:checked');
 }
@@ -740,10 +784,16 @@ function closeConfigure() {
     focusIn('[data-action="configure"]');
 }
 
+// A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
 async function updateSettings(patch) {
+    const before = deliveryMode();
     state.settings = await api("POST", "settings", patch);
-    renderTop();
-    renderBanner();
+    if (deliveryMode() !== before && state.snapshot) {
+        render();
+    } else {
+        renderTop();
+        renderBanner();
+    }
 }
 
 async function saveConfigure() {
@@ -753,11 +803,11 @@ async function saveConfigure() {
     d.error = "";
     renderDialog();
     try {
-        await updateSettings({ learning: d.learning });
+        await updateSettings({ learning: d.learning, delivery: d.delivery });
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="configure"]');
-        toast(`Learning mode: ${LEARNING[learningMode()].label}`);
+        toast(`Saved. Learning: ${LEARNING[learningMode()].pill} · Delivery: ${DELIVERY[deliveryRepoMode()].pill}`);
     } catch (err) {
         d.saving = false;
         d.error = err.message;
@@ -766,11 +816,13 @@ async function saveConfigure() {
     }
 }
 
-// Keeps Tab inside the open dialog; a radio group is a single tab stop (its checked radio).
+// Keeps Tab inside the open dialog; each radio group is a single tab stop (its checked radio).
 function trapTab(e) {
-    const radios = [...document.querySelectorAll('#dialog input[name="learning"]')];
-    const radio = radios.find((x) => x.checked) ?? radios[0];
-    const stops = [radio, ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean);
+    const groupStop = (name) => {
+        const radios = [...document.querySelectorAll(`#dialog input[name="${name}"]`)];
+        return radios.find((x) => x.checked) ?? radios[0];
+    };
+    const stops = [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
     if (!stops.length) return;
     const first = stops[0];
     const last = stops[stops.length - 1];
@@ -909,13 +961,19 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         startLine ? `data-start="${startLine}"` : "",
         endLine ? `data-end="${endLine}"` : "",
     ].join(" ");
+    const k = esc(key);
+    const batching = deliveryMode() !== "immediate";
+    const buttons = batching
+        ? `<button data-action="submit" data-key="${k}" data-draft="0" title="Send this comment to Copilot right away"${p?.sending ? " disabled" : ""}>Send now</button>`
+            + `<button class="primary" data-action="submit" data-key="${k}" data-draft="1" title="Hold this comment as a draft until you submit the review"${p?.sending ? " disabled>Saving…" : ">Add to review"}</button>`
+        : `<button class="primary" data-action="submit" data-key="${k}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
     return `<div class="composer${open ? " open" : ""}" ${data}>`
         + (label ? `<div class="label">${esc(label)}</div>` : "")
-        + `<textarea data-composer="${esc(key)}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${esc(draft)}</textarea>`
+        + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${esc(draft)}</textarea>`
         + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
-        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to send · Esc to close</span>`
-        + `<button data-action="cancel" data-key="${esc(key)}">Cancel</button>`
-        + `<button class="primary" data-action="submit" data-key="${esc(key)}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button></div>`
+        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to close</span>`
+        + `<button data-action="cancel" data-key="${k}">Cancel</button>`
+        + `${buttons}</div>`
         + `</div>`;
 }
 
@@ -924,6 +982,9 @@ function deliveryHtml(m) {
     if (!d) return "";
     const resend = (label) => `<button class="link" data-action="retry" data-message="${esc(m.messageId)}">${label}</button>`;
     switch (d.state) {
+        case "draft":
+            return `<span class="delivery draft" title="Held until you submit the review">Draft · <button class="link" data-action="send-draft" data-message="${esc(m.messageId)}">Send now</button>`
+                + ` · <button class="link" data-action="discard-draft" data-message="${esc(m.messageId)}">Discard</button></span>`;
         case "saving":
             return `<span class="delivery saving">Sending to Copilot…</span>`;
         case "queued": {
@@ -1232,7 +1293,12 @@ function closeComposer(key, discard) {
     render();
 }
 
-async function submit(key) {
+// The composer's default action: undefined lets the server apply the delivery mode; otherwise the comment is held as a draft.
+function defaultDraft() {
+    return deliveryMode() === "immediate" ? undefined : true;
+}
+
+async function submit(key, draft = defaultDraft()) {
     const box = document.querySelector(`.composer[data-key="${CSS.escape(key)}"]`);
     const textarea = box?.querySelector("textarea");
     if (!box || !textarea) return;
@@ -1249,8 +1315,9 @@ async function submit(key) {
     render();
     try {
         let res;
+        const hold = draft === undefined ? {} : { draft };
         if (key.startsWith("reply:")) {
-            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: state.review.description?.version ?? 0 });
+            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: state.review.description?.version ?? 0, ...hold });
         } else {
             const d = box.dataset;
             res = await api("POST", "threads", {
@@ -1263,6 +1330,7 @@ async function submit(key) {
                 descriptionVersion: state.review.description?.version ?? 0,
                 body,
                 clientRequestId: pending.clientRequestId,
+                ...hold,
             });
         }
         setDraft(key, "");
@@ -1336,13 +1404,53 @@ async function onClick(e) {
             case "cancel":
                 closeComposer(target.dataset.key, true);
                 break;
-            case "submit":
-                await submit(target.dataset.key);
+            case "submit": {
+                const flag = target.dataset.draft;
+                await submit(target.dataset.key, flag === "1" ? true : flag === "0" ? false : defaultDraft());
                 break;
+            }
             case "retry":
                 await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/retry`, {});
                 await loadState();
                 toast("Sent to Copilot again");
+                break;
+            case "send-draft": {
+                const res = await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/send`, {});
+                await loadState();
+                toast(res?.error ? res.error : "Sent to Copilot", Boolean(res?.error));
+                break;
+            }
+            case "discard-draft":
+                await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/discard`, {});
+                await loadState();
+                toast("Draft discarded");
+                break;
+            case "submit-review": {
+                if (state.submitting) break;
+                state.submitting = true;
+                renderTop();
+                try {
+                    const res = await api("POST", "submit", {});
+                    if (res?.error) toast(res.error, true);
+                    else toast(`Sent ${res.submitted} ${res.submitted === 1 ? "comment" : "comments"} to Copilot`);
+                } finally {
+                    state.submitting = false;
+                    await loadState();
+                }
+                break;
+            }
+            case "delivery-choose": {
+                const mode = target.dataset.mode;
+                const res = await api("POST", "delivery", { mode });
+                await loadState();
+                toast(mode === "immediate"
+                    ? (res?.submitted ? `Sending each comment now. Sent ${res.submitted} waiting ${res.submitted === 1 ? "draft" : "drafts"}.` : "Sending each comment now")
+                    : "Batching comments. Submit the review when you are done.");
+                break;
+            }
+            case "delivery-reask":
+                await api("POST", "delivery", { mode: null });
+                await loadState();
                 break;
             case "toggle": {
                 const id = target.dataset.thread;
@@ -1387,8 +1495,8 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
-    if (el.name === "learning" && state.dialog) {
-        state.dialog.learning = el.value;
+    if ((el.name === "learning" || el.name === "delivery") && state.dialog) {
+        state.dialog[el.name] = el.value;
         return;
     }
     if (el.dataset?.action !== "status") return;

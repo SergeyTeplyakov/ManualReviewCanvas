@@ -608,12 +608,6 @@ async function capture(browser, url, theme, resetLearning) {
     await fitHeight(page, 700);
     await shot("lessons");
 
-    // The per-repository learning setting.
-    await page.locator('#top [data-action="configure"]').click();
-    await page.locator("#dialog .modal").waitFor();
-    await shot("configure");
-    await page.keyboard.press("Escape");
-
     // The pending scope is its own review of what is not committed yet. Switch back so the next theme starts on the full review.
     await page.locator('#top [data-action="scope"][data-scope="pending"]').click();
     await page.locator('#top [data-scope="pending"][aria-pressed="true"]:not([disabled])').waitFor();
@@ -622,6 +616,51 @@ async function capture(browser, url, theme, resetLearning) {
     await shot("pending");
     await page.locator('#top [data-action="scope"][data-scope="all"]').click();
     await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
+
+    // The per-repository settings: switch delivery to Batch before saving.
+    await page.setViewportSize({ width: WIDTH, height: 1200 });
+    await page.locator('#top [data-action="configure"]').click();
+    await page.locator("#dialog .modal").waitFor();
+    const modal = await page.locator("#dialog .modal").boundingBox();
+    await page.setViewportSize({ width: WIDTH, height: Math.ceil(modal.height + 64) });
+    await page.waitForTimeout(250);
+    await page.locator('#dialog input[name="delivery"][value="batch"]').check();
+    await shot("configure");
+    await page.locator('#dialog [data-action="dialog-save"]').click();
+    await page.locator("#dialog .modal").waitFor({ state: "detached" });
+    await page.locator("#toast").waitFor({ state: "hidden" });
+
+    // In batch mode comments wait as drafts until Submit review sends them in one message.
+    await nav(page, "file", "test/client.test.ts");
+    const composeOn = async (needle, body) => {
+        await page.locator("tr.row", { hasText: needle }).first().locator("td.ln").nth(1).hover();
+        await page.mouse.down();
+        await page.mouse.up();
+        const composer = page.locator("textarea[data-composer^='line:']");
+        await composer.waitFor();
+        await composer.focus();
+        await page.keyboard.type(body);
+    };
+    const drafts = page.locator('[data-action="discard-draft"]');
+    for (const [needle, body] of [
+        ["retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },", "Use `maxAttempts: 3` so one test can cover more than a single retry."],
+        ['.mockResolvedValueOnce(new Response("busy", { status: 503 }))', "Add the 429 case with `Retry-After: 1`, so the header path is covered end to end."],
+    ]) {
+        const before = await drafts.count();
+        await composeOn(needle, body);
+        await page.locator(`.composer button[data-draft="1"][data-key^="line:"]`).click();
+        await page.waitForFunction((n) => document.querySelectorAll('[data-action="discard-draft"]').length > n, before);
+    }
+    await page.waitForTimeout(1700); // let the new-thread highlight fade
+    await composeOn('new Response("nope", { status: 404 })', "Also assert that a 404 is not retried: `fetch` is called once.");
+    await fitHeight(page, 1500);
+    await shot("batch");
+    await page.keyboard.press("Escape");
+    while (await drafts.count()) {
+        const before = await drafts.count();
+        await drafts.first().click();
+        await page.waitForFunction((n) => document.querySelectorAll('[data-action="discard-draft"]').length < n, before);
+    }
 
     await context.close();
 }

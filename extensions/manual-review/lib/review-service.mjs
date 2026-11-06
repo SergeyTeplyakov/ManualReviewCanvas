@@ -197,7 +197,9 @@ function matchesRevision(file, oldLines, newLines) {
     return true;
 }
 
-const DELIVERY_RANK = { saving: 0, failed: 1, queued: 2, processing: 3, "no-reply": 4, replied: 5 };
+// A draft is held by the reviewer and has not been offered to the agent yet.
+const DELIVERY_RANK = { draft: -1, saving: 0, failed: 1, queued: 2, processing: 3, "no-reply": 4, replied: 5 };
+const REVIEW_DELIVERY_CHOICES = ["immediate", "batch"];
 
 export class ReviewService extends EventEmitter {
     constructor({ store, git = gitDefault, log = () => {} }) {
@@ -541,7 +543,7 @@ export class ReviewService extends EventEmitter {
                 body,
                 createdAt: nowIso(),
                 clientRequestId: input.clientRequestId ?? null,
-                ...(author === "user" ? { delivery: { state: "saving", attempts: 0 } } : { outcome: input.outcome ?? null }),
+                ...(author === "user" ? { delivery: { state: input.hold ? "draft" : "saving", attempts: 0 } } : { outcome: input.outcome ?? null }),
                 ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             const thread = {
@@ -594,7 +596,7 @@ export class ReviewService extends EventEmitter {
                 ...(thread.kind === "overview" && author === "user" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             if (author === "user") {
-                message.delivery = { state: "saving", attempts: 0 };
+                message.delivery = { state: input.hold ? "draft" : "saving", attempts: 0 };
                 if (thread.status !== "active") thread.status = "active";
             } else {
                 message.outcome = input.outcome ?? null;
@@ -602,9 +604,22 @@ export class ReviewService extends EventEmitter {
                 message.inReplyTo = input.inReplyTo ?? null;
                 const target = input.inReplyTo
                     ? thread.messages.find((m) => m.messageId === input.inReplyTo)
-                    : [...thread.messages].reverse().find((m) => m.author === "user" && m.delivery && m.delivery.state !== "replied");
+                    : [...thread.messages].reverse().find((m) => m.author === "user" && m.delivery && !["replied", "draft"].includes(m.delivery.state));
                 if (input.inReplyTo && !target) throw notFound(`Message ${input.inReplyTo} not found in thread ${threadId}.`);
-                if (target?.delivery) target.delivery = { ...target.delivery, state: "replied", repliedAt: nowIso() };
+                if (target?.delivery?.state === "draft") {
+                    throw new ReviewError("conflict", `Message ${input.inReplyTo} is a draft the reviewer has not sent yet; reply after it is delivered.`);
+                }
+                if (target?.delivery) {
+                    const repliedAt = nowIso();
+                    target.delivery = { ...target.delivery, state: "replied", repliedAt };
+                    // One reply answers every comment the same submitted review added to this thread.
+                    const batchId = target.delivery.batchId;
+                    for (const m of batchId ? thread.messages : []) {
+                        if (m !== target && m.author === "user" && m.delivery?.batchId === batchId && m.delivery.state !== "replied") {
+                            m.delivery = { ...m.delivery, state: "replied", repliedAt };
+                        }
+                    }
+                }
                 message.lessonIds = [];
                 for (const l of lessonsInput) {
                     const lesson = applyLesson(review, { reviewId, threadId, messageId: message.messageId }, l);
@@ -639,7 +654,7 @@ export class ReviewService extends EventEmitter {
             const message = findThread(review, threadId).messages.find((m) => m.messageId === messageId);
             if (!message || message.author !== "user") throw invalid(`Message ${messageId} is not a user message in ${threadId}.`);
             const current = message.delivery;
-            const initial = current?.state === "saving" && !current.attempts;
+            const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
             if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state))) return { write: false, value: null };
             const attempt = { attemptId: randomUUID(), attempts: (current.attempts ?? 0) + 1 };
             message.delivery = { state: "saving", ...attempt, error: null, updatedAt: nowIso() };
@@ -647,6 +662,59 @@ export class ReviewService extends EventEmitter {
         });
         if (claim) this.changed(reviewId, "delivery");
         return claim;
+    }
+
+    // Claims every draft in one atomic update so a submitted review is sent once, as one batch.
+    async claimDrafts(reviewId) {
+        const claims = await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft");
+            if (!drafts.length) return { write: false, value: [] };
+            const batchId = randomUUID();
+            const value = drafts.map(({ thread, message }) => {
+                const attempt = { attemptId: randomUUID(), attempts: (message.delivery.attempts ?? 0) + 1 };
+                message.delivery = { state: "saving", ...attempt, batchId, error: null, updatedAt: nowIso() };
+                return { threadId: thread.threadId, messageId: message.messageId, ...attempt };
+            });
+            return { review, value };
+        });
+        if (claims.length) this.changed(reviewId, "delivery");
+        return claims;
+    }
+
+    // Records how an ask-mode review delivers comments; null asks the reviewer again.
+    async setDeliveryChoice(reviewId, mode) {
+        if (mode !== null && !REVIEW_DELIVERY_CHOICES.includes(mode)) {
+            throw invalid(`mode must be one of ${REVIEW_DELIVERY_CHOICES.join(", ")}, or null.`);
+        }
+        const changed = await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if ((review.deliveryMode ?? null) === mode) return { write: false, value: false };
+            if (mode) review.deliveryMode = mode;
+            else delete review.deliveryMode;
+            return { review, value: true };
+        });
+        if (changed) this.changed(reviewId, "delivery-mode");
+        return mode;
+    }
+
+    // Removes a draft the agent has never seen; a thread left without messages goes with it.
+    async discardDraft(reviewId, messageId) {
+        const result = await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            const entry = allMessages(review).find((e) => e.message.messageId === messageId);
+            if (!entry) throw notFound(`Message ${messageId} not found.`);
+            if (entry.message.author !== "user" || entry.message.delivery?.state !== "draft") {
+                throw new ReviewError("conflict", `Message ${messageId} is not a draft; only drafts can be discarded.`);
+            }
+            const { thread } = entry;
+            thread.messages = thread.messages.filter((m) => m !== entry.message);
+            const threadRemoved = thread.messages.length === 0;
+            if (threadRemoved) review.threads = review.threads.filter((t) => t !== thread);
+            return { review, value: { threadId: thread.threadId, threadRemoved } };
+        });
+        this.changed(reviewId, "message");
+        return result;
     }
 
     // Applies a delivery transition; later states win within the claimed attempt.
@@ -746,6 +814,7 @@ export class ReviewService extends EventEmitter {
                 total: review.threads.length,
                 active: review.threads.filter((t) => t.status === "active").length,
                 awaitingAgent: allMessages(review).filter((e) => ["queued", "processing", "failed", "no-reply"].includes(e.message.delivery?.state)).length,
+                drafts: allMessages(review).filter((e) => e.message.delivery?.state === "draft").length,
             },
             threads: threads.map((t) => ({
                 threadId: t.threadId,

@@ -1,9 +1,9 @@
 // Delivers user review comments to the agent conversation and tracks their lifecycle:
 // saving -> queued -> processing -> replied | no-reply, or failed (retryable).
 import { EventEmitter } from "node:events";
-import { buildCommentPrompt } from "./prompt.mjs";
+import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 
-const MARKER_RE = /\[manual-review mr:([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]/;
+const MARKER_RE = /\[manual-review mr:([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]/g;
 
 const nowIso = () => new Date().toISOString();
 
@@ -43,59 +43,100 @@ export class Delivery extends EventEmitter {
         this.touched.add(reviewId);
         const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry });
         if (!claim) return { delivered: false, skipped: true };
+        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId);
+    }
 
+    // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
+    async submit(reviewId, instanceId) {
+        this.touched.add(reviewId);
+        const claims = await this.service.claimDrafts(reviewId);
+        if (!claims.length) return { submitted: 0, delivered: false };
+        const result = await this.sendClaimed(reviewId, claims, instanceId);
+        return { submitted: claims.length, ...result };
+    }
+
+    async repoLearning(repoRoot) {
+        try {
+            return await this.learning(repoRoot);
+        } catch (err) {
+            this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+            return "off";
+        }
+    }
+
+    // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
+    async sendClaimed(reviewId, claims, instanceId) {
         let sessionMessageId;
         try {
-            const ctx = await this.service.promptContext(reviewId, threadId);
-            const message = ctx.thread.messages.find((m) => m.messageId === messageId);
-            let learning = "off";
-            try {
-                learning = await this.learning(ctx.review.repoRoot);
-            } catch (err) {
-                this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+            const threadIds = [...new Set(claims.map((c) => c.threadId))];
+            const contexts = [];
+            for (const threadId of threadIds) contexts.push(await this.service.promptContext(reviewId, threadId));
+            const learning = await this.repoLearning(contexts[0].review.repoRoot);
+            let built;
+            if (claims.length === 1) {
+                const ctx = contexts[0];
+                const message = ctx.thread.messages.find((m) => m.messageId === claims[0].messageId);
+                built = buildCommentPrompt({ ...ctx, message, instanceId, learning });
+            } else {
+                const ids = new Set(claims.map((c) => c.messageId));
+                const groups = contexts.map((ctx) => ({
+                    thread: ctx.thread,
+                    messages: ctx.thread.messages.filter((m) => ids.has(m.messageId)),
+                    excerpt: ctx.excerpt,
+                    selected: ctx.selected,
+                }));
+                built = buildBatchPrompt({ review: contexts[contexts.length - 1].review, groups, instanceId, learning });
             }
-
-            const { prompt, displayPrompt } = buildCommentPrompt({ ...ctx, message, instanceId, learning });
-            sessionMessageId = await this.send({ prompt, displayPrompt, mode: "enqueue" });
+            sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue" });
         } catch (err) {
-            this.log(`manual-review: failed to deliver ${messageId}: ${err?.message ?? err}`, "warning");
-            await this.service.setDelivery(reviewId, messageId, { state: "failed", error: String(err?.message ?? err) }, claim);
-            return { delivered: false, error: String(err?.message ?? err) };
+            const error = String(err?.message ?? err);
+            this.log(`manual-review: failed to deliver ${claims.map((c) => c.messageId).join(", ")}: ${error}`, "warning");
+            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, { state: "failed", error }, c);
+            return { delivered: false, error };
         }
 
-        const target = { reviewId, messageId, attemptId: claim.attemptId };
-        if (sessionMessageId) this.bySessionMessageId.set(sessionMessageId, target);
-        await this.service.setDelivery(reviewId, messageId, {
-            state: "queued",
-            sessionMessageId: sessionMessageId ?? null,
-            queuedAt: nowIso(),
-            error: null,
-        }, claim);
+        const targets = claims.map((c) => ({ reviewId, messageId: c.messageId, attemptId: c.attemptId }));
+        if (sessionMessageId) this.bySessionMessageId.set(sessionMessageId, targets);
+        for (const c of claims) {
+            await this.service.setDelivery(reviewId, c.messageId, {
+                state: "queued",
+                sessionMessageId: sessionMessageId ?? null,
+                queuedAt: nowIso(),
+                error: null,
+            }, c);
+        }
         // The user.message event can arrive before send() resolves.
         if (sessionMessageId && this.seenSessionMessageIds.delete(sessionMessageId)) {
-            await this.service.setDelivery(reviewId, messageId, { state: "processing", processingAt: nowIso() }, claim);
+            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, { state: "processing", processingAt: nowIso() }, c);
         }
         return { delivered: true, sessionMessageId };
     }
 
     async onUserMessage(event) {
         const data = event?.data ?? {};
-        let target = data.messageId ? this.bySessionMessageId.get(data.messageId) : undefined;
-        if (!target) {
-            const m = MARKER_RE.exec(`${data.transformedContent ?? ""}\n${data.content ?? ""}`);
-            if (m) target = { reviewId: m[1], messageId: m[2] };
+        let targets = data.messageId ? this.bySessionMessageId.get(data.messageId) : undefined;
+        if (!targets) {
+            const text = `${data.transformedContent ?? ""}\n${data.content ?? ""}`;
+            const seen = new Set();
+            targets = [];
+            for (const m of text.matchAll(MARKER_RE)) {
+                if (seen.has(m[2])) continue;
+                seen.add(m[2]);
+                targets.push({ reviewId: m[1], messageId: m[2] });
+            }
         }
-        if (!target) {
+        if (!targets.length) {
             if (data.messageId) {
                 this.seenSessionMessageIds.add(data.messageId);
                 if (this.seenSessionMessageIds.size > 200) this.seenSessionMessageIds.delete(this.seenSessionMessageIds.values().next().value);
             }
             return;
         }
-        this.touched.add(target.reviewId);
-        await this.service.setDelivery(target.reviewId, target.messageId, { state: "processing", processingAt: nowIso() }, target);
+        for (const target of targets) {
+            this.touched.add(target.reviewId);
+            await this.service.setDelivery(target.reviewId, target.messageId, { state: "processing", processingAt: nowIso() }, target);
+        }
     }
-
     setBusy(busy) {
         if (this.busy === busy) return;
         this.busy = busy;

@@ -38,7 +38,7 @@ const reviewFixture = (overrides = {}) => ({
     threads: [], lessons: [],
     ...overrides,
 });
-const settingsFixture = (overrides = {}) => ({ repoName: "repo", learning: "off", configured: false, dismissed: false, ...overrides });
+const settingsFixture = (overrides = {}) => ({ repoName: "repo", learning: "off", delivery: "immediate", configured: false, dismissed: false, ...overrides });
 const jsonResponse = (data, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
 const clicker = (app) => (action, dataset = {}) => {
     const target = { tagName: "BUTTON", dataset: { action, ...dataset } };
@@ -121,16 +121,22 @@ test("the Configure dialog is an accessible modal that preselects the draft mode
     const app = await loadApp();
     assert.equal(app.run("dialogHtml()"), "", "closed by default");
     app.state.settings = settingsFixture({ repoName: "Org/Repo <x>", learning: "suggest", configured: true });
-    app.state.dialog = { learning: "suggest", saving: false, error: "" };
+    app.state.dialog = { learning: "suggest", delivery: "batch", saving: false, error: "" };
     const html = app.run("dialogHtml()");
     assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc"/);
-    assert.match(html, /<h2 id="dialog-title">Learn from review feedback<\/h2>/);
-    assert.match(html, /<p id="dialog-desc" class="muted">Setting for Org\/Repo &lt;x&gt;\. /);
+    assert.match(html, /<h2 id="dialog-title">Review settings<\/h2>/);
+    assert.match(html, /<p id="dialog-desc" class="muted">Settings for Org\/Repo &lt;x&gt;\. /);
+    assert.match(html, /<legend>Learn from review feedback<\/legend>.*<legend>Send comments to Copilot<\/legend>/);
     assert.deepEqual(
         [...html.matchAll(/<input type="radio" name="learning" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
         [["off", false], ["suggest", true], ["auto", false]],
     );
+    assert.deepEqual(
+        [...html.matchAll(/<input type="radio" name="delivery" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
+        [["immediate", false], ["batch", true], ["ask", false]],
+    );
     assert.match(html, /<span class="choice-title">Save automatically<\/span>/);
+    assert.match(html, /<span class="choice-title">Ask for each review<\/span>/);
     assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
@@ -142,7 +148,7 @@ test("the Configure dialog is an accessible modal that preselects the draft mode
     assert.match(busy, /value="auto" checked/);
 
     app.state.settings = settingsFixture({ repoName: undefined });
-    assert.match(app.run("dialogHtml()"), /Setting for this repository\./);
+    assert.match(app.run("dialogHtml()"), /Settings for this repository\./);
 });
 
 test("the Configure dialog opens on the saved mode, keeps the page inert behind it, traps Tab, and closes on Escape", async () => {
@@ -203,7 +209,7 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
         const body = JSON.parse(init.body);
         posts.push([init.method, url, body]);
         if (failure) return jsonResponse({ error: { message: failure } }, 500);
-        settings = { ...settings, ...(body.learning ? { learning: body.learning, configured: true } : {}), ...(body.dismissed ? { dismissed: true } : {}) };
+        settings = { ...settings, ...(body.learning ? { learning: body.learning, configured: true } : {}), ...(body.delivery ? { delivery: body.delivery } : {}), ...(body.dismissed ? { dismissed: true } : {}) };
         return jsonResponse(settings);
     };
     const app = await loadApp({ fetch });
@@ -230,14 +236,17 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
 
     await click("configure");
     assert.equal(app.state.dialog.learning, "off");
+    assert.equal(app.state.dialog.delivery, "immediate");
     await app.run("onChange")({ target: { name: "learning", value: "auto" } });
+    await app.run("onChange")({ target: { name: "delivery", value: "batch" } });
     await click("dialog-save");
-    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { learning: "auto" }]);
+    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { learning: "auto", delivery: "batch" }]);
     assert.equal(app.state.dialog, null);
     assert.equal(app.state.settings.learning, "auto");
+    assert.equal(app.state.settings.delivery, "batch");
     assert.equal(app.node("#dialog").innerHTML, "");
-    assert.match(app.node("#top").innerHTML, /Learning: Auto-save/);
-    assert.equal(app.node("#toast").textContent, "Learning mode: Save automatically");
+    assert.match(app.node("#top").innerHTML, /Delivery: Batch<\/span>.*Learning: Auto-save/);
+    assert.equal(app.node("#toast").textContent, "Saved. Learning: Auto-save · Delivery: Batch");
     assert.equal(app.focused.at(-1), '[data-action="configure"]');
 
     await click("configure");
@@ -413,4 +422,223 @@ test("switching scope loads the other review, remembers each review's own view, 
     settings = undefined;
     await app.run("loadState()");
     assert.equal(app.state.settings, null, "a server without settings hides the learning controls");
+});
+
+const userMessage = (messageId, state) => ({ messageId, author: "user", body: messageId, delivery: { state } });
+const draftThreads = () => [
+    { threadId: "t1", status: "active", messages: [userMessage("m1", "draft"), { messageId: "a1", author: "agent", body: "ok" }, userMessage("m2", "draft")] },
+    { threadId: "t2", status: "active", messages: [userMessage("m3", "queued")] },
+];
+
+test("the top bar offers Submit review while drafts wait, and shows how comments reach Copilot", async () => {
+    const app = await loadApp();
+    const top = () => {
+        app.run("renderTop()");
+        return app.node("#top").innerHTML;
+    };
+    app.state.settings = settingsFixture({ configured: true });
+    app.state.review = reviewFixture({ threads: draftThreads() });
+
+    let html = top();
+    assert.match(html, /<button class="primary" data-action="submit-review"[^>]*>Submit review \(2\)<\/button>/, "agent replies and delivered comments are not drafts");
+    app.state.submitting = true;
+    html = top();
+    assert.match(html, /data-action="submit-review"[^>]* disabled>Submitting…<\/button>/);
+    assert.doesNotMatch(html, /Submit review \(/);
+    app.state.submitting = false;
+    app.state.review = reviewFixture({ threads: [draftThreads()[1]] });
+    assert.doesNotMatch(top(), /submit-review/, "nothing to submit without drafts");
+
+    for (const [delivery, deliveryMode, pill, reask] of [
+        ["immediate", undefined, "Immediate", false],
+        ["batch", "immediate", "Batch", false],
+        ["ask", undefined, "Ask", false],
+        ["ask", "batch", "Batch", true],
+        ["ask", "immediate", "Immediate", true],
+        ["unexpected", undefined, "Immediate", false],
+    ]) {
+        app.state.settings = settingsFixture({ configured: true, delivery });
+        app.state.review = reviewFixture({ deliveryMode });
+        html = top();
+        assert.match(html, new RegExp(`Delivery: ${pill}</span>`), `${delivery}/${deliveryMode}`);
+        assert.equal(/data-action="delivery-reask"[^>]*>Change</.test(html), reask, `only a decided ask-mode review offers Change (${delivery}/${deliveryMode})`);
+    }
+    app.state.settings = null;
+    app.state.review = reviewFixture({ threads: draftThreads() });
+    html = top();
+    assert.doesNotMatch(html, /Delivery:/);
+    assert.match(html, /Submit review \(2\)/, "a comment held on request can still be submitted without settings");
+});
+
+test("an ask-mode review asks how to send comments until the reviewer chooses", async () => {
+    const app = await loadApp();
+    const banner = (settings, review) => {
+        app.state.settings = settings;
+        app.state.review = review;
+        app.run("renderBanner()");
+        return app.node("#banner");
+    };
+    const ask = settingsFixture({ configured: true, delivery: "ask" });
+
+    const shown = banner(ask, reviewFixture());
+    assert.equal(shown.hidden, false);
+    assert.match(shown.innerHTML, /How should Copilot receive your comments on this review\?/);
+    assert.match(shown.innerHTML, /Until you choose, new comments wait as drafts\./);
+    assert.match(shown.innerHTML, /data-action="delivery-choose" data-mode="immediate"[^>]*>Send each now</);
+    assert.match(shown.innerHTML, /data-action="delivery-choose" data-mode="batch"[^>]*>Batch into a review</);
+    assert.match(banner(ask, reviewFixture({ threads: [draftThreads()[1], { threadId: "t3", messages: [userMessage("m4", "draft")] }] })).innerHTML, /1 draft comment is waiting\./);
+    assert.match(banner(ask, reviewFixture({ threads: draftThreads() })).innerHTML, /2 draft comments are waiting\./);
+
+    assert.equal(banner(ask, reviewFixture({ deliveryMode: "batch" })).hidden, true, "a decided review is not asked again");
+    assert.equal(banner(ask, reviewFixture({ deliveryMode: "immediate" })).hidden, true);
+    assert.equal(banner(settingsFixture({ configured: true, delivery: "batch" }), reviewFixture()).hidden, true);
+    assert.equal(banner(null, reviewFixture()).hidden, true);
+    assert.equal(banner(ask, null).hidden, true);
+
+    const both = banner(settingsFixture({ delivery: "ask" }), reviewFixture());
+    assert.equal(both.innerHTML.match(/class="banner-row"/g).length, 2, "the learning and delivery questions can show together");
+});
+
+test("the composer and the draft badge follow the delivery mode", async () => {
+    const app = await loadApp();
+    const composer = () => app.run(`composerHtml("file:a.cs", { kind: "file", path: "a.cs" })`);
+    const setMode = (delivery, deliveryMode) => {
+        app.state.settings = delivery ? settingsFixture({ configured: true, delivery }) : null;
+        app.state.review = reviewFixture({ deliveryMode });
+    };
+
+    for (const [delivery, deliveryMode, batching, defaultDraft] of [
+        [null, undefined, false, null],
+        ["immediate", undefined, false, null],
+        ["ask", "immediate", false, null],
+        ["batch", undefined, true, true],
+        ["ask", undefined, true, true],
+        ["ask", "batch", true, true],
+    ]) {
+        const label = `${delivery}/${deliveryMode}`;
+        setMode(delivery, deliveryMode);
+        const html = composer();
+        assert.equal(app.read("defaultDraft() ?? null"), defaultDraft, `immediate lets the server decide; otherwise the composer holds (${label})`);
+        if (batching) {
+            assert.match(html, /<button data-action="submit" data-key="file:a.cs" data-draft="0"[^>]*>Send now<\/button>/, label);
+            assert.match(html, /<button class="primary" data-action="submit" data-key="file:a.cs" data-draft="1"[^>]*>Add to review<\/button>/, label);
+            assert.match(html, /Ctrl\+Enter to add to review/, label);
+        } else {
+            assert.match(html, /<button class="primary" data-action="submit" data-key="file:a.cs" >Comment<\/button>/, label);
+            assert.doesNotMatch(html, /data-draft=|Add to review/, label);
+            assert.match(html, /Ctrl\+Enter to send/, label);
+        }
+    }
+
+    setMode("batch");
+    app.run(`state.pending.set("file:a.cs", { sending: true })`);
+    assert.match(composer(), /data-draft="0" title="[^"]*" disabled>Send now<\/button><button class="primary" [^>]*data-draft="1" title="[^"]*" disabled>Saving…<\/button>/);
+
+    const badge = app.run(`deliveryHtml(${JSON.stringify(userMessage('m"1', "draft"))})`);
+    assert.match(badge, /^<span class="delivery draft" title="Held until you submit the review">Draft · /);
+    assert.match(badge, /<button class="link" data-action="send-draft" data-message="m&quot;1">Send now<\/button>/);
+    assert.match(badge, /<button class="link" data-action="discard-draft" data-message="m&quot;1">Discard<\/button>/);
+});
+
+test("posting a comment sends the draft flag the clicked button chose, or lets the server decide", async () => {
+    const posts = [];
+    let settings = settingsFixture({ configured: true, delivery: "batch" });
+    const fetch = async (url, init) => {
+        if (url === "/api/state") return jsonResponse({ review: reviewFixture(), session: { busy: false }, settings });
+        if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: "r1", files: [] });
+        posts.push([url, JSON.parse(init.body)]);
+        return jsonResponse({ threadId: "t9", messageId: "m9", duplicate: false, draft: true });
+    };
+    const app = await loadApp({ fetch, CSS: { escape: (s) => s } });
+    const click = clicker(app);
+    app.run("render = () => {};");
+    const box = (key, dataset) => {
+        Object.assign(app.node(`.composer[data-key="${key}"]`), { dataset, querySelector: () => ({ value: " Rename this ", focus() {} }) });
+    };
+    box("file:a.cs", { kind: "file", path: "a.cs" });
+    box("reply:t1", {});
+    Object.assign(app.node('[data-thread-id="t9"]'), { classList: { add() {}, remove() {} } });
+    await app.run("loadState()");
+
+    const sent = async (dataset) => {
+        await click("submit", dataset);
+        const [url, body] = posts.at(-1);
+        return [url, body.body, Object.hasOwn(body, "draft") ? body.draft : "server decides"];
+    };
+    assert.deepEqual(await sent({ key: "file:a.cs", draft: "1" }), ["/api/threads", "Rename this", true]);
+    assert.deepEqual(await sent({ key: "file:a.cs", draft: "0" }), ["/api/threads", "Rename this", false]);
+    assert.deepEqual(await sent({ key: "reply:t1", draft: "1" }), ["/api/threads/t1/messages", "Rename this", true]);
+    assert.deepEqual(await sent({ key: "file:a.cs" }), ["/api/threads", "Rename this", true], "Ctrl+Enter in batch mode adds to the review");
+
+    settings = settingsFixture({ configured: true, delivery: "immediate" });
+    await app.run("loadState()");
+    assert.deepEqual(await sent({ key: "reply:t1" }), ["/api/threads/t1/messages", "Rename this", "server decides"]);
+    assert.equal(app.read("state.pending.size"), 0, "every post completed");
+});
+
+test("Send now, Discard, Submit review and the delivery question call the server and report the outcome", async () => {
+    const calls = [];
+    const replies = new Map();
+    const fetch = async (url, init) => {
+        if (url === "/api/state") {
+            calls.push("GET /api/state");
+            return jsonResponse({ review: reviewFixture({ threads: draftThreads() }), session: { busy: false }, settings: settingsFixture({ configured: true, delivery: "ask" }) });
+        }
+        if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: "r1", files: [] });
+        calls.push(`${init.method} ${url} ${init.body}`);
+        const reply = replies.get(url);
+        if (!reply) throw new Error(`unexpected request ${init.method} ${url}`);
+        return typeof reply === "function" ? reply() : reply;
+    };
+    const app = await loadApp({ fetch });
+    const click = clicker(app);
+    app.run("render = () => {}; var submittingSeen = []; renderTop = () => { submittingSeen.push(state.submitting); };");
+    const toast = () => [app.node("#toast").textContent, app.node("#toast").className === "error"];
+    const act = async (action, dataset) => {
+        const before = calls.length;
+        await click(action, dataset);
+        return calls.slice(before);
+    };
+
+    replies.set("/api/messages/m%3A1/send", jsonResponse({ delivered: true, sessionMessageId: "sm-1" }));
+    assert.deepEqual(await act("send-draft", { message: "m:1" }), ["POST /api/messages/m%3A1/send {}", "GET /api/state"]);
+    assert.deepEqual(toast(), ["Sent to Copilot", false]);
+    replies.set("/api/messages/m%3A1/send", jsonResponse({ delivered: false, error: "session closed" }));
+    await act("send-draft", { message: "m:1" });
+    assert.deepEqual(toast(), ["session closed", true]);
+
+    replies.set("/api/messages/m1/discard", jsonResponse({ threadId: "t1", threadRemoved: false }));
+    assert.deepEqual(await act("discard-draft", { message: "m1" }), ["POST /api/messages/m1/discard {}", "GET /api/state"]);
+    assert.deepEqual(toast(), ["Draft discarded", false]);
+
+    for (const [submitted, text] of [[3, "Sent 3 comments to Copilot"], [1, "Sent 1 comment to Copilot"]]) {
+        replies.set("/api/submit", jsonResponse({ submitted, delivered: true, sessionMessageId: "sm-2" }));
+        assert.deepEqual(await act("submit-review"), ["POST /api/submit {}", "GET /api/state"]);
+        assert.deepEqual(toast(), [text, false]);
+    }
+    assert.deepEqual(app.read("submittingSeen"), [true, true], "the button shows Submitting while the request is in flight");
+    assert.equal(app.state.submitting, false);
+    replies.set("/api/submit", jsonResponse({ submitted: 2, delivered: false, error: "session closed" }));
+    await act("submit-review");
+    assert.deepEqual(toast(), ["session closed", true]);
+    replies.set("/api/submit", jsonResponse({ error: { message: "disk full" } }, 500));
+    assert.deepEqual(await act("submit-review"), ["POST /api/submit {}", "GET /api/state"], "the review is reloaded even when the submission fails");
+    assert.deepEqual(toast(), ["disk full", true]);
+    assert.equal(app.state.submitting, false, "a failed submission never sticks in the submitting state");
+    app.state.submitting = true;
+    assert.deepEqual(await act("submit-review"), [], "a second click while submitting does nothing");
+    app.state.submitting = false;
+
+    for (const [mode, submitted, text] of [
+        ["immediate", 2, "Sending each comment now. Sent 2 waiting drafts."],
+        ["immediate", 1, "Sending each comment now. Sent 1 waiting draft."],
+        ["immediate", 0, "Sending each comment now"],
+        ["batch", 0, "Batching comments. Submit the review when you are done."],
+    ]) {
+        replies.set("/api/delivery", jsonResponse({ mode, submitted }));
+        assert.deepEqual(await act("delivery-choose", { mode }), [`POST /api/delivery {"mode":"${mode}"}`, "GET /api/state"]);
+        assert.deepEqual(toast(), [text, false], `${mode} ${submitted}`);
+    }
+    replies.set("/api/delivery", jsonResponse({ mode: null, submitted: 0 }));
+    assert.deepEqual(await act("delivery-reask"), ['POST /api/delivery {"mode":null}', "GET /api/state"]);
 });

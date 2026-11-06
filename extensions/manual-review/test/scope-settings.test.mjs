@@ -398,15 +398,15 @@ test("SettingsService keeps learning off until a mode is chosen and stores each 
     const other = path.join(tmp, "other-repo");
     await runGit(tmp, ["init", "-q", "-b", "main", other]);
 
-    const initial = { repoName: "proj", learning: "off", configured: false, dismissed: false };
+    const initial = { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false };
     assert.deepEqual(await settings.get(repo), initial);
     assert.deepEqual(await settings.update(repo, { dismissed: true }), { ...initial, dismissed: true }, "dismissing the prompt does not choose a mode");
-    assert.deepEqual(await settings.update(repo, { learning: "suggest" }), { ...initial, learning: "suggest", configured: true, dismissed: true });
-    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, learning: "suggest", configured: true, dismissed: true }, "the choice is stored, not cached");
-    assert.deepEqual(await settings.update(repo, { dismissed: false }), { ...initial, learning: "suggest", configured: true }, "the prompt flag does not touch the mode");
+    assert.deepEqual(await settings.update(repo, { learning: "suggest" }), { ...initial, learning: "suggest", delivery: "immediate", configured: true, dismissed: true });
+    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, learning: "suggest", delivery: "immediate", configured: true, dismissed: true }, "the choice is stored, not cached");
+    assert.deepEqual(await settings.update(repo, { dismissed: false }), { ...initial, learning: "suggest", delivery: "immediate", configured: true }, "the prompt flag does not touch the mode");
     assert.deepEqual(await settings.update(repo, { learning: "off" }), { ...initial, configured: true }, "off is a deliberate choice, not the unset state");
-    assert.deepEqual(await settings.get(other), { repoName: "other-repo", learning: "off", configured: false, dismissed: false }, "other repositories are unaffected");
-    assert.deepEqual(await settings.update(other, { learning: "auto" }), { repoName: "other-repo", learning: "auto", configured: true, dismissed: false });
+    assert.deepEqual(await settings.get(other), { repoName: "other-repo", learning: "off", delivery: "immediate", configured: false, dismissed: false }, "other repositories are unaffected");
+    assert.deepEqual(await settings.update(other, { learning: "auto" }), { repoName: "other-repo", learning: "auto", delivery: "immediate", configured: true, dismissed: false });
     assert.equal((await settings.get(repo)).learning, "off");
 
     const saved = JSON.parse(await readFile(store.settingsFile(), "utf8"));
@@ -424,16 +424,16 @@ test("SettingsService shares a choice between clones of the same remote", async 
         await git(dir, "remote", "add", "origin", url);
     }
     await settings.update(first, { learning: "auto" });
-    assert.deepEqual(await settings.get(second), { repoName: "repo", learning: "auto", configured: true, dismissed: false });
+    assert.deepEqual(await settings.get(second), { repoName: "repo", learning: "auto", delivery: "immediate", configured: true, dismissed: false });
 });
 
 test("SettingsService rejects invalid updates without writing anything", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    for (const patch of [undefined, {}, { learning: "sometimes" }, { learning: null }, { learning: 1 }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { learning: "auto", dismissed: "no" }]) {
+    for (const patch of [undefined, {}, { learning: "sometimes" }, { learning: null }, { learning: 1 }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { learning: "auto", dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { learning: "auto", delivery: "later" }]) {
         await assert.rejects(() => settings.update(repo, patch), (e) => e.code === "invalid_input", JSON.stringify(patch));
     }
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
     await assert.rejects(() => access(store.settingsFile()), { code: "ENOENT" });
 });
 
@@ -443,13 +443,13 @@ test("an unreadable or hand-edited settings file never blocks reading the effect
     await writeFile(store.settingsFile(), "{ not json");
     const logs = [];
     const settings = new SettingsService({ store, log: (m) => logs.push(m) });
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
     assert.equal(logs.length, 1);
     assert.match(logs[0], /^settings unreadable: /);
 
     const { key } = await repoIdentity(repo);
     await writeFile(store.settingsFile(), JSON.stringify({ version: 1, repos: { [key]: { learning: "loud", promptDismissed: "yes" } } }));
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", configured: false, dismissed: false }, "unknown values are ignored");
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false }, "unknown values are ignored");
 });
 
 test("Delivery hands the repository's learning mode to the prompt and falls back to off when it cannot be read", async () => {
@@ -506,16 +506,16 @@ test("the settings API stores the learning mode per repository and the next comm
 
     await withServer({ instanceId: "inst-settings", getReviewId: () => reviewId, service, delivery, settings }, async ({ headers, state, post }) => {
         const initial = await state();
-        assert.deepEqual(initial.settings, { repoName: "proj", learning: "off", configured: false, dismissed: false });
+        assert.deepEqual(initial.settings, { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
         assert.equal(initial.review.scope, "all");
 
         const chosen = await post("/api/settings", { learning: "suggest" });
         assert.equal(chosen.status, 200);
-        assert.deepEqual(chosen.json, { repoName: "proj", learning: "suggest", configured: true, dismissed: false });
+        assert.deepEqual(chosen.json, { repoName: "proj", learning: "suggest", delivery: "immediate", configured: true, dismissed: false });
         assert.deepEqual((await state()).settings, chosen.json);
         assert.deepEqual((await post("/api/settings", { dismissed: true })).json, { ...chosen.json, dismissed: true });
 
-        for (const body of [{}, { learning: "loud" }, { learning: null }, { dismissed: "yes" }]) {
+        for (const body of [{}, { learning: "loud" }, { learning: null }, { dismissed: "yes" }, { delivery: "later" }]) {
             const rejected = await post("/api/settings", body);
             assert.equal(rejected.status, 400, JSON.stringify(body));
             assert.equal(rejected.json.error.code, "invalid_input");

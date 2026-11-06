@@ -10,6 +10,20 @@ import { ReviewError } from "./review-service.mjs";
 export const LEARNING_MODES = ["off", "suggest", "auto"];
 export const DEFAULT_LEARNING = "off";
 
+// When the agent receives the reviewer's comments:
+//   immediate - each comment is sent as soon as it is posted
+//   batch     - comments wait as drafts until the reviewer submits them together
+//   ask       - each review asks the reviewer to choose immediate or batch
+export const DELIVERY_MODES = ["immediate", "batch", "ask"];
+export const DEFAULT_DELIVERY = "immediate";
+
+// The delivery mode in effect for one review, or null while an ask-mode review is undecided.
+export function resolveDelivery(repoMode, review) {
+    const mode = DELIVERY_MODES.includes(repoMode) ? repoMode : DEFAULT_DELIVERY;
+    if (mode !== "ask") return mode;
+    return review?.deliveryMode === "immediate" || review?.deliveryMode === "batch" ? review.deliveryMode : null;
+}
+
 // Reduces equivalent remote spellings (https, ssh, scp-style, credentials, port, .git) to host/owner/repo.
 export function normalizeRemoteUrl(url) {
     let value = String(url ?? "").trim().replace(/\\/g, "/");
@@ -61,17 +75,21 @@ export class SettingsService {
         return {
             repoName: identity.name,
             learning: configured ? entry.learning : DEFAULT_LEARNING,
+            delivery: DELIVERY_MODES.includes(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
             configured,
             dismissed: entry?.promptDismissed === true,
         };
     }
 
     async update(repoRoot, patch = {}) {
-        if (patch.learning === undefined && patch.dismissed === undefined) {
-            throw new ReviewError("invalid_input", "Provide learning or dismissed.");
+        if (patch.learning === undefined && patch.delivery === undefined && patch.dismissed === undefined) {
+            throw new ReviewError("invalid_input", "Provide learning, delivery, or dismissed.");
         }
         if (patch.learning !== undefined && !LEARNING_MODES.includes(patch.learning)) {
             throw new ReviewError("invalid_input", `learning must be one of ${LEARNING_MODES.join(", ")}.`);
+        }
+        if (patch.delivery !== undefined && !DELIVERY_MODES.includes(patch.delivery)) {
+            throw new ReviewError("invalid_input", `delivery must be one of ${DELIVERY_MODES.join(", ")}.`);
         }
         if (patch.dismissed !== undefined && typeof patch.dismissed !== "boolean") {
             throw new ReviewError("invalid_input", "dismissed must be a boolean.");
@@ -80,6 +98,7 @@ export class SettingsService {
         await this.store.updateSettings((settings) => {
             const entry = { ...settings.repos[identity.key] };
             if (patch.learning !== undefined) entry.learning = patch.learning;
+            if (patch.delivery !== undefined) entry.delivery = patch.delivery;
             if (patch.dismissed !== undefined) entry.promptDismissed = patch.dismissed;
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });

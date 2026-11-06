@@ -17,7 +17,7 @@ Start a new session in a repository with some changes and try:
 Open my changes against origin/main in the manual review canvas. Don't change anything until I comment.
 ```
 
-You get a PR-style review of your local changes. Select a line, write a comment, click **Comment**, and the agent picks it up in the same conversation, fixes it or answers, and replies in the thread.
+You get a PR-style review of your local changes. Select a line, write a comment, click **Comment**, and the agent picks it up in the same conversation, fixes it or answers, and replies in the thread. Prefer to read everything first? Switch the repository to batch delivery and submit all your comments at once, like a PR review.
 
 To review only what you haven't committed yet, ask for your pending changes instead, or switch between **All changes** and **Pending changes** in the top bar at any time.
 
@@ -25,7 +25,7 @@ To review only what you haven't committed yet, ask for your pending changes inst
 
 Agents write code faster than you can read it. Reviewing in chat is awkward: you paste file names and line numbers, describe which `if` you mean, and lose track of what was already addressed. PR tools have the right shape for this, but they only kick in after you push, and their comments go to people, not to the agent that wrote the code.
 
-Manual Review Canvas brings the PR review loop to your working tree. You read the diff and decide what matters. Each comment goes to the agent with the exact file, side, line range, and surrounding hunk. The agent fixes or answers, replies in the thread, and the diff refreshes. Nothing is pushed, published, or committed unless you ask for it.
+Manual Review Canvas brings the PR review loop to your working tree. You read the diff and decide what matters. Each comment goes to the agent with the exact file, side, line range, and surrounding hunk, either as soon as you post it or together with the rest of your review. The agent fixes or answers, replies in the thread, and the diff refreshes. Nothing is pushed, published, or committed unless you ask for it.
 
 Optionally, the agent also learns from your comments. Choose per repository whether it stays off, proposes guidelines for you to approve, or saves them to your repository instructions on its own, so you don't have to make the same comment twice.
 
@@ -66,11 +66,18 @@ Learning from your feedback is optional and set per repository. The first review
   <img alt="A first-use notice asking whether to learn from review feedback in orders-api, with Suggest, Save automatically, and Not now." src="docs/images/banner-light.png">
 </picture>
 
-**Configure** in the top bar changes the choice any time. It is stored on your machine and never committed.
+**Configure** in the top bar changes the choice any time, along with how your comments reach the agent: send each one as you post it, batch them into a review, or ask for each review. Both settings are stored on your machine and never committed.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/configure-dark.png">
-  <img alt="The Configure dialog with three options: Off, Suggest (selected), and Save automatically." src="docs/images/configure-light.png">
+  <img alt="The Configure dialog. Learn from review feedback: Off, Suggest (selected), and Save automatically. Send comments to Copilot: Send each comment now, Batch into a review (selected), and Ask for each review." src="docs/images/configure-light.png">
+</picture>
+
+In batch mode, **Add to review** keeps a comment as a draft the agent can't see yet. Work your way through the diff, send or discard any single draft, then click **Submit review** to hand them all over in one message. The agent works through them in one pass and replies in each thread.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/batch-dark.png">
+  <img alt="Batch delivery: two draft comments with Send now and Discard links, a third comment being written with Send now and Add to review buttons, and Submit review (2) in the top bar." src="docs/images/batch-light.png">
 </picture>
 
 Guidelines learned from your comments are collected in one place, with their status (proposed, saved, or declined) and where each one went.
@@ -85,12 +92,12 @@ Guidelines learned from your comments are collected in one place, with their sta
 - **Scope.** **All changes**, the default, compares your working tree, including staged, unstaged, and untracked files, against the merge base with a base ref (`origin/HEAD`, `main`, or `master` by default), so it covers a whole branch or PR. **Pending changes** compares the working tree with `HEAD`, so it covers only what you haven't committed and needs no comparison base. When switching to All changes, a base is inferred or must be supplied explicitly. Each scope keeps its own threads, and you switch between them in the top bar. Narrow either one to paths or exclude files when you open it.
 - **Comments.** Start a thread on the overview, a file, a change, or a line range on either side of the diff. Selecting a file shows the whole file with changes inline; selecting a folder shows only the diffs under it.
 - **Highlighting.** Code is syntax highlighted locally. Markdown stays as source, with every marker such as `**`, `#`, and `[text](url)` left in place, but headings, emphasis, inline code, links, lists, quotes, tables, and fenced code blocks are styled so prose changes are easy to read.
-- **Delivery.** Posting a comment starts a turn in the conversation that owns the canvas. Its state is visible on the thread: saving, queued, processing, replied, no reply (the agent finished without answering), or failed, with a resend for the last two. A comment is never shown as delivered just because you clicked a button.
+- **Delivery.** Set per repository. **Immediate**, the default, starts a turn in the conversation that owns the canvas as soon as you post a comment. **Batch** keeps comments as drafts until you click **Submit review**, which sends every draft in one message; any draft can also be sent on its own or discarded, and the agent never sees a draft until it is sent. **Ask** lets you choose immediate or batch the first time you comment on each review. The state of each comment is visible on the thread: draft, saving, queued, processing, replied, no reply (the agent finished without answering), or failed, with a resend for the last two. A comment is never shown as delivered just because you clicked a button.
 - **Replies.** The agent answers in the thread with an outcome (answered, changed, blocked, disagreed, or needs input), how it verified the change, and any guideline it proposed or saved.
 - **Learning.** Off until you choose, per repository. **Off** only addresses each comment. **Suggest** proposes a guideline in the thread and saves it only after you approve. **Save automatically** writes settled guidelines to the repository's instruction files and tells you where; personal rules still wait for your confirmation. The first review in a repository asks once, and **Configure** changes it later. The **Lessons learned** list shows each guideline as proposed, saved, or declined.
 - **Refresh.** When the agent goes idle, the canvas captures a new revision. Threads follow their code when lines shift. If the commented code is gone, the thread keeps the original snippet and is marked outdated, not resolved.
 - **Statuses.** Threads are active, resolved, won't fix, or closed. You decide when something is resolved, or tell the agent to resolve threads it has addressed.
-- **Local only.** The canvas is served from `127.0.0.1` with a per-panel token. Reviews and your learning settings are stored in `~/.copilot/extension-data/manual-review`, never in the repository. Nothing is uploaded anywhere.
+- **Local only.** The canvas is served from `127.0.0.1` with a per-panel token. Reviews and your learning and delivery settings are stored in `~/.copilot/extension-data/manual-review`, never in the repository. Nothing is uploaded anywhere.
 
 Symlinks are shown as their link-target text, not the contents of the target. Full-file selections are checked against the saved revision before creating an anchor or delivering code context; refresh and check the selection again if the file has changed.
 

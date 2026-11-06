@@ -169,7 +169,7 @@ const actions = [
     },
     {
         name: "get_review",
-        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered.",
+        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered. Messages in the draft delivery state are still held by the reviewer; do not act on them until they are delivered.",
         inputSchema: {
             type: "object",
             properties: {
@@ -188,7 +188,7 @@ const actions = [
     },
     {
         name: "reply",
-        description: "Post the agent's answer to a user's review comment in its thread. Call once per delivered comment after acting on it.",
+        description: "Post the agent's answer to a user's review comment in its thread. Call once per delivered comment after acting on it; for a submitted review, one reply per thread answers all of that thread's new comments.",
         inputSchema: {
             type: "object",
             properties: {
