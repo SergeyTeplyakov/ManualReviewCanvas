@@ -5,13 +5,13 @@ import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runGit } from "../lib/git.mjs";
 import { Store } from "../lib/store.mjs";
 import { ReviewService, computeReviewId, scopeOf } from "../lib/review-service.mjs";
 import { Delivery } from "../lib/delivery.mjs";
 import { startReviewServer } from "../lib/server.mjs";
-import { SettingsService, normalizeRemoteUrl, repoIdentity } from "../lib/settings.mjs";
+import { SettingsService, normalizeRemoteUrl, pathKey, repoIdentity } from "../lib/settings.mjs";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web");
 const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
@@ -368,6 +368,43 @@ test("normalizeRemoteUrl reduces equivalent remote spellings to host/owner/repo"
     assert.notEqual(normalizeRemoteUrl("https://github.com/owner/other"), "github.com/owner/repo");
 });
 
+test("normalizeRemoteUrl keeps a non-default port, which can name a different server", () => {
+    assert.equal(normalizeRemoteUrl("ssh://git@host.example:2222/o/r.git"), "host.example:2222/o/r");
+    assert.equal(normalizeRemoteUrl("https://host.example:8443/o/r"), "host.example:8443/o/r");
+    assert.notEqual(normalizeRemoteUrl("https://host.example:8443/o/r"), normalizeRemoteUrl("https://host.example/o/r"));
+    assert.equal(normalizeRemoteUrl("https://host.example:22/o/r"), "host.example:22/o/r", "a default port only counts for its own scheme");
+    assert.equal(normalizeRemoteUrl("http://host.example:80/o/r"), "host.example/o/r");
+    assert.equal(normalizeRemoteUrl("git://host.example:9418/o/r"), "host.example/o/r");
+});
+
+test("pathKey folds case only where the file system usually does", () => {
+    assert.equal(pathKey("/Work/Repo", "linux"), "/Work/Repo");
+    assert.equal(pathKey("C:\\Work\\Repo", "win32"), "c:\\work\\repo");
+    assert.equal(pathKey("/Work/Repo", "darwin"), "/work/repo");
+});
+
+test("repoIdentity resolves a local-path origin against its repository", async () => {
+    const init = async (dir) => {
+        await mkdir(dir, { recursive: true });
+        await runGit(tmp, ["init", "-q", "-b", "main", dir]);
+        return dir;
+    };
+    const first = await init(path.join(tmp, "rel-a", "repo"));
+    const second = await init(path.join(tmp, "rel-b", "repo"));
+    for (const r of [first, second]) await git(r, "remote", "add", "origin", "../upstream.git");
+    const a = await repoIdentity(first);
+    assert.notEqual(a.key, (await repoIdentity(second)).key, "the same relative origin names different repositories");
+    assert.equal(a.name, "upstream");
+
+    const upstream = path.join(tmp, "rel-a", "upstream.git");
+    const byPath = await init(path.join(tmp, "rel-c"));
+    await git(byPath, "remote", "add", "origin", upstream);
+    assert.equal((await repoIdentity(byPath)).key, a.key, "an absolute path names the same repository");
+    const byUrl = await init(path.join(tmp, "rel-d"));
+    await git(byUrl, "remote", "add", "origin", pathToFileURL(upstream).href);
+    assert.equal((await repoIdentity(byUrl)).key, a.key, "a file URL names the same repository");
+});
+
 test("repoIdentity follows the origin remote across clones and worktrees, and falls back to the git directory", async () => {
     const main = path.join(tmp, "ident");
     await runGit(tmp, ["init", "-q", "-b", "main", main]);
@@ -569,6 +606,34 @@ test("the scope API switches the served review and keeps the repository setting"
 
             assert.deepEqual((await post("/api/scope", { scope: "all" })).json, { reviewId: allId, scope: "all" });
             assert.equal((await state()).review.reviewId, allId);
+        },
+    );
+});
+
+test("after a scope switch, a write from a page still showing the previous review is refused", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const delivery = new Delivery({ service, send: async () => "sm-1" });
+    const allId = await service.ensureReview({ repoPath: repo, base: "main" });
+    let currentId = allId;
+
+    await withServer(
+        { instanceId: "inst-stale", getReviewId: () => currentId, service, delivery, settings, onReviewChange: (id) => { currentId = id; } },
+        async ({ headers, post }) => {
+            const switched = await post("/api/scope", { scope: "pending" }, { ...headers, "X-MR-Review": allId });
+            const pendingId = switched.json.reviewId;
+            assert.notEqual(pendingId, allId);
+
+            const comment = { kind: "file", path: "a.cs", body: "Meant for the all review", clientRequestId: "c-stale" };
+            const stale = await post("/api/threads", comment, { ...headers, "X-MR-Review": allId });
+            assert.equal(stale.status, 409);
+            assert.equal(stale.json.error.code, "conflict");
+            assert.equal((await service.getReview(allId)).threads.length, 0);
+            assert.equal((await service.getReview(pendingId)).threads.length, 0, "nothing lands in the review that replaced it");
+
+            const current = await post("/api/threads", { ...comment, clientRequestId: "c-current" }, { ...headers, "X-MR-Review": pendingId });
+            assert.equal(current.status, 200);
+            assert.equal((await service.getReview(pendingId)).threads.length, 1);
         },
     );
 });

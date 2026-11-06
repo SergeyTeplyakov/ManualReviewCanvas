@@ -360,9 +360,12 @@ function uuid() {
 
 async function api(method, path, body) {
     const headers = { "X-MR-Token": TOKEN };
+    if (state.review) headers["X-MR-Review"] = state.review.reviewId;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const res = await fetch(`/api/${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     const json = await res.json().catch(() => ({}));
+    // The server switched reviews under this page; catch up so the next attempt targets the review on screen.
+    if (res.status === 409) scheduleReload();
     if (!res.ok) throw new Error(json?.error?.message ?? `${res.status} ${res.statusText}`);
     return json;
 }

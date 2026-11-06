@@ -77,8 +77,8 @@ The canvas implementation must provide:
   posted. Batch holds comments as drafts until the reviewer submits the review,
   then delivers all of them in one turn; a single draft can also be sent or
   discarded. Ask lets the reviewer choose immediate or batch for each review.
-  Drafts are never offered to the agent: they are excluded from thread history,
-  and the agent must not reply to one.
+  Drafts are never offered to the agent: they are excluded from thread history
+  and from the review the agent reads, and the agent must not reply to one.
 - Stable review, thread, and message IDs. Each comment records the repository,
   review revision, file path, diff side, line range, selected text, and surrounding
   hunk. A retry of the same post must not silently duplicate a thread or fix.

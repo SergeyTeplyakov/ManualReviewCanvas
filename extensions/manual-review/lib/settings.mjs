@@ -1,5 +1,6 @@
 // Per-repository user settings, kept in the extension's user-local data and never written into the repository.
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git.mjs";
 import { ReviewError } from "./review-service.mjs";
 
@@ -24,17 +25,41 @@ export function resolveDelivery(repoMode, review) {
     return review?.deliveryMode === "immediate" || review?.deliveryMode === "batch" ? review.deliveryMode : null;
 }
 
-// Reduces equivalent remote spellings (https, ssh, scp-style, credentials, port, .git) to host/owner/repo.
+const DEFAULT_PORTS = { http: "80", https: "443", ssh: "22", "git+ssh": "22", "ssh+git": "22", git: "9418" };
+
+// Reduces equivalent remote spellings (https, ssh, scp-style, credentials, default port, .git) to host/owner/repo.
+// A non-default port is kept, since it can name a different server.
 export function normalizeRemoteUrl(url) {
     let value = String(url ?? "").trim().replace(/\\/g, "/");
     const scp = /^(?:[^@/\s]+@)?([^:/\s]{2,}):(?!\/\/)(.+)$/.exec(value);
     if (scp && !value.includes("://")) {
         value = `${scp[1]}/${scp[2]}`;
     } else {
+        const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(value)?.[1].toLowerCase();
         value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/^[^@/]*@/, "");
+        value = value.replace(/^([^/:]+):(\d+)(?=\/|$)/, (all, host, port) => (DEFAULT_PORTS[scheme] === port ? host : all));
     }
-    value = value.replace(/^([^/:]+):\d+(?=\/|$)/, "$1");
     return value.replace(/\.git\/*$/i, "").replace(/\/+$/, "").toLowerCase();
+}
+
+// Case-insensitive file systems (the Windows and macOS defaults) fold a path's case; others keep it.
+export function pathKey(p, platform = process.platform) {
+    return platform === "win32" || platform === "darwin" ? p.toLowerCase() : p;
+}
+
+// Git treats a URL without a scheme or an scp-style host as a local path, relative to the repository.
+function localRemotePath(url, repoRoot) {
+    const value = url.trim();
+    if (/^file:\/\//i.test(value)) {
+        try {
+            return fileURLToPath(value);
+        } catch {
+            return path.resolve(repoRoot, decodeURIComponent(value.replace(/^file:\/\//i, "")));
+        }
+    }
+    if (value.includes("://")) return null;
+    if (/^(?:[^@/\\\s]+@)?[^:/\\\s]{2,}:/.test(value)) return null;
+    return path.resolve(repoRoot, value);
 }
 
 function remoteName(url) {
@@ -47,11 +72,15 @@ function remoteName(url) {
 export async function repoIdentity(repoRoot, git = gitDefault) {
     const remote = await git.runGit(repoRoot, ["config", "--get", "remote.origin.url"], { allowFail: true });
     const url = remote.ok ? remote.stdout.trim() : "";
-    if (url) return { key: `remote:${normalizeRemoteUrl(url)}`, name: remoteName(url) };
+    if (url) {
+        const local = localRemotePath(url, repoRoot);
+        if (local) return { key: `remote:file:${pathKey(local)}`, name: remoteName(url) };
+        return { key: `remote:${normalizeRemoteUrl(url)}`, name: remoteName(url) };
+    }
     const common = await git.runGit(repoRoot, ["rev-parse", "--git-common-dir"], { allowFail: true });
     const dir = common.ok ? common.stdout.trim() : "";
     const root = dir ? path.resolve(repoRoot, dir) : path.resolve(repoRoot);
-    return { key: `local:${root.toLowerCase()}`, name: path.basename(repoRoot) };
+    return { key: `local:${pathKey(root)}`, name: path.basename(repoRoot) };
 }
 
 export class SettingsService {

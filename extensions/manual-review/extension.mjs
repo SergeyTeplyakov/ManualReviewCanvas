@@ -37,7 +37,13 @@ const delivery = new Delivery({
     send: (options) => session.send(options),
     reviewIds: openReviewIds,
     learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
+    sessionId: () => session?.sessionId,
 });
+
+// Comments a stopped provider claimed but never sent become failed so the reviewer can resend them.
+function recoverClaims(reviewId) {
+    service.recoverAbandonedClaims(reviewId).catch((err) => log(`manual-review: claim recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
+}
 
 function toCanvasError(err) {
     if (err instanceof CanvasError) return err;
@@ -75,6 +81,7 @@ async function ensureServer(instanceId, reviewId) {
             onReviewChange: async (nextId) => {
                 entry.reviewId = nextId;
                 await store.setInstanceReview(instanceId, nextId);
+                recoverClaims(nextId);
             },
             service,
             delivery,
@@ -95,6 +102,7 @@ async function ensureServer(instanceId, reviewId) {
     const switched = entry.reviewId !== reviewId;
     entry.reviewId = reviewId;
     await entry.ready;
+    recoverClaims(reviewId);
     // A page that is already open keeps showing the previous review until told to reload.
     if (switched) service.changed(reviewId, "open");
     return entry;
@@ -169,7 +177,7 @@ const actions = [
     },
     {
         name: "get_review",
-        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered. Messages in the draft delivery state are still held by the reviewer; do not act on them until they are delivered.",
+        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered. Comments the reviewer is still holding as drafts are left out; counts.drafts says how many there are.",
         inputSchema: {
             type: "object",
             properties: {

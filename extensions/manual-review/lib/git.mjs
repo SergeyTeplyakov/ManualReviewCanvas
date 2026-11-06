@@ -60,7 +60,8 @@ export function buildPathspec(paths, exclude) {
 export function safeJoin(repoRoot, relPath) {
     const full = path.resolve(repoRoot, relPath);
     const rel = path.relative(repoRoot, full);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) throw new Error(`Path escapes repository: ${relPath}`);
+    // Only a whole ".." component escapes; names such as "..notes" stay inside the repository.
+    if (rel.split(/[\\/]/)[0] === ".." || path.isAbsolute(rel)) throw new Error(`Path escapes repository: ${relPath}`);
     return full;
 }
 
@@ -118,8 +119,9 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     }
     const pathspec = buildPathspec(paths, exclude);
 
+    // Explicit prefixes keep the a/ and b/ headers the parser expects, whatever diff.noprefix or diff.mnemonicPrefix say.
     const diff = await runGit(repoRoot, [
-        "diff", "--no-color", "--no-ext-diff", "--find-renames", `-U${contextLines}`, baseCommit, "--", ...pathspec,
+        "diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
     const files = parseUnifiedDiff(diff.stdout);
     const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);

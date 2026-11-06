@@ -10,7 +10,7 @@ import { ReviewService } from "../lib/review-service.mjs";
 import { Delivery } from "../lib/delivery.mjs";
 import { parseUnifiedDiff } from "../lib/diff.mjs";
 import { relocate } from "../lib/anchors.mjs";
-import { captureSnapshot, readWorkingFile, runGit } from "../lib/git.mjs";
+import { captureSnapshot, readWorkingFile, runGit, safeJoin } from "../lib/git.mjs";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false", ...args]);
@@ -277,4 +277,70 @@ test("working-file reads reject paths through escaping directory links and allow
     await assert.rejects(readWorkingFile(repo, "escape/secret.txt"), /escapes repository/);
     assert.deepEqual(await readWorkingFile(repo, "contained/safe.txt"), ["safe"]);
     await assert.rejects(readWorkingFile(repo, "../outside/secret.txt"), /escapes repository/);
+});
+
+test("safeJoin accepts names that start with two dots and rejects parent traversal", async (t) => {
+    const dir = await temporary(t);
+    assert.equal(safeJoin(dir, "..notes"), path.join(dir, "..notes"));
+    assert.equal(safeJoin(dir, "docs/..draft.md"), path.join(dir, "docs", "..draft.md"));
+    for (const bad of ["..", "../x", "a/../../x"]) assert.throws(() => safeJoin(dir, bad), /escapes repository/, bad);
+});
+
+test("diff paths parse the same whatever the diff prefix settings, and a file named ..notes is reviewable", async (t) => {
+    const { repo } = await fixture(t);
+    await writeFile(path.join(repo, "..notes"), "kept inside the repository\n");
+    for (const key of ["diff.mnemonicPrefix", "diff.noprefix"]) {
+        await git(repo, "config", key, "true");
+        const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
+        assert.deepEqual(snapshot.files.map((f) => f.path).sort(), ["..notes", "a.txt"], key);
+        assert.ok(snapshot.files.find((f) => f.path === "a.txt").hunks.length > 0, key);
+    }
+});
+
+test("going idle settles only the comments this conversation was processing", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const mine = await service.createThread(id, { kind: "overview", body: "Mine" });
+    const theirs = await service.createThread(id, { kind: "overview", body: "Theirs" });
+    let n = 0;
+    const send = async () => `sm-${++n}`;
+    const a = new Delivery({ service, send, sessionId: () => "session-a" });
+    const b = new Delivery({ service: new ReviewService({ store: new Store(store.root) }), send, sessionId: () => "session-b" });
+    const sentA = await a.deliver(id, mine.thread.threadId, mine.message.messageId, "inst");
+    const sentB = await b.deliver(id, theirs.thread.threadId, theirs.message.messageId, "inst");
+    await a.onUserMessage({ data: { messageId: sentA.sessionMessageId } });
+    await b.onUserMessage({ data: { messageId: sentB.sessionMessageId } });
+    const delivery = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    assert.equal((await delivery(mine)).processedBy, "session-a");
+    assert.equal((await delivery(theirs)).processedBy, "session-b");
+
+    await a.onIdle();
+    assert.equal((await delivery(mine)).state, "no-reply");
+    assert.equal((await delivery(theirs)).state, "processing", "another conversation's turn may still be running");
+    await b.onIdle();
+    assert.equal((await delivery(theirs)).state, "no-reply");
+});
+
+test("a comment claimed by a provider that stopped can be resent, and live claims are left alone", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const stopped = new ReviewService({ store: new Store(store.root), pid: 999999 });
+    const id = await stopped.ensureReview({ repoPath: repo, base: "main" });
+    const orphan = await stopped.createThread(id, { kind: "overview", body: "Claimed by a provider that crashed" });
+    const live = await service.createThread(id, { kind: "overview", body: "Still being sent" });
+    assert.equal(orphan.message.delivery.claimPid, 999999);
+    assert.equal(live.message.delivery.claimPid, process.pid);
+
+    const checker = new ReviewService({ store: new Store(store.root), pid: 4242, isProcessAlive: (pid) => pid !== 999999 });
+    assert.deepEqual(await checker.recoverAbandonedClaims(id), [orphan.message.messageId]);
+    const delivery = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    assert.equal((await delivery(orphan)).state, "failed");
+    assert.match((await delivery(orphan)).error, /Resend it/);
+    assert.equal((await delivery(live)).state, "saving", "a running provider keeps its claim");
+    assert.deepEqual(await service.recoverAbandonedClaims(id), [], "this provider never recovers its own claims");
+
+    const sent = [];
+    const resend = new Delivery({ service, send: async (options) => { sent.push(options); return "sm-resend"; } });
+    assert.equal((await resend.deliver(id, orphan.thread.threadId, orphan.message.messageId, "inst", { retry: true })).delivered, true);
+    assert.equal(sent.length, 1);
+    assert.equal((await delivery(orphan)).state, "queued");
 });

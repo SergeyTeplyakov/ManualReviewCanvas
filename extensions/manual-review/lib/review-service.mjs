@@ -201,12 +201,29 @@ function matchesRevision(file, oldLines, newLines) {
 const DELIVERY_RANK = { draft: -1, saving: 0, failed: 1, queued: 2, processing: 3, "no-reply": 4, replied: 5 };
 const REVIEW_DELIVERY_CHOICES = ["immediate", "batch"];
 
+// Signal 0 only probes the process; EPERM means it exists but belongs to another user.
+function processAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return err?.code === "EPERM";
+    }
+}
+
 export class ReviewService extends EventEmitter {
-    constructor({ store, git = gitDefault, log = () => {} }) {
+    /**
+     * @param {object} p
+     * @param {number} [p.pid] process recorded on delivery claims
+     * @param {(pid: number) => boolean} [p.isProcessAlive] whether a claiming process is still running
+     */
+    constructor({ store, git = gitDefault, log = () => {}, pid = process.pid, isProcessAlive = processAlive }) {
         super();
         this.store = store;
         this.git = git;
         this.log = log;
+        this.pid = pid;
+        this.isProcessAlive = isProcessAlive;
         this.refreshes = new Map();
     }
 
@@ -543,7 +560,7 @@ export class ReviewService extends EventEmitter {
                 body,
                 createdAt: nowIso(),
                 clientRequestId: input.clientRequestId ?? null,
-                ...(author === "user" ? { delivery: { state: input.hold ? "draft" : "saving", attempts: 0 } } : { outcome: input.outcome ?? null }),
+                ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
                 ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             const thread = {
@@ -596,7 +613,7 @@ export class ReviewService extends EventEmitter {
                 ...(thread.kind === "overview" && author === "user" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             if (author === "user") {
-                message.delivery = { state: input.hold ? "draft" : "saving", attempts: 0 };
+                message.delivery = input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid };
                 if (thread.status !== "active") thread.status = "active";
             } else {
                 message.outcome = input.outcome ?? null;
@@ -657,7 +674,7 @@ export class ReviewService extends EventEmitter {
             const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
             if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state))) return { write: false, value: null };
             const attempt = { attemptId: randomUUID(), attempts: (current.attempts ?? 0) + 1 };
-            message.delivery = { state: "saving", ...attempt, error: null, updatedAt: nowIso() };
+            message.delivery = { state: "saving", ...attempt, claimPid: this.pid, error: null, updatedAt: nowIso() };
             return { review, value: attempt };
         });
         if (claim) this.changed(reviewId, "delivery");
@@ -673,7 +690,7 @@ export class ReviewService extends EventEmitter {
             const batchId = randomUUID();
             const value = drafts.map(({ thread, message }) => {
                 const attempt = { attemptId: randomUUID(), attempts: (message.delivery.attempts ?? 0) + 1 };
-                message.delivery = { state: "saving", ...attempt, batchId, error: null, updatedAt: nowIso() };
+                message.delivery = { state: "saving", ...attempt, batchId, claimPid: this.pid, error: null, updatedAt: nowIso() };
                 return { threadId: thread.threadId, messageId: message.messageId, ...attempt };
             });
             return { review, value };
@@ -738,12 +755,32 @@ export class ReviewService extends EventEmitter {
         return applied;
     }
 
-    // Marks every user message still "processing" as unanswered (called when the agent goes idle).
-    async settleProcessing(reviewId) {
+    // Marks user messages still "processing" as unanswered (called when the agent goes idle).
+    // With a sessionId, only messages that session was processing are settled; another session's turn may still be running.
+    async settleProcessing(reviewId, { sessionId } = {}) {
         const ids = await this.store.updateReview(reviewId, (review) => {
             if (!review) return { write: false, value: [] };
-            const hits = allMessages(review).filter((e) => e.message.delivery?.state === "processing");
+            const hits = allMessages(review).filter(({ message }) => message.delivery?.state === "processing"
+                && (!sessionId || !message.delivery.processedBy || message.delivery.processedBy === sessionId));
             for (const { message } of hits) message.delivery = { ...message.delivery, state: "no-reply", updatedAt: nowIso() };
+            return hits.length ? { review, value: hits.map((h) => h.message.messageId) } : { write: false, value: [] };
+        });
+        if (ids.length) this.changed(reviewId, "delivery");
+        return ids;
+    }
+
+    // A comment claimed by a provider process that has since stopped can never be sent, so it is failed
+    // and the reviewer can resend it. Claims held by running providers, including other sessions', are left alone.
+    async recoverAbandonedClaims(reviewId) {
+        const ids = await this.store.updateReview(reviewId, (review) => {
+            if (!review) return { write: false, value: [] };
+            const hits = allMessages(review).filter(({ message }) => {
+                const d = message.delivery;
+                return d?.state === "saving" && Number.isInteger(d.claimPid) && d.claimPid !== this.pid && !this.isProcessAlive(d.claimPid);
+            });
+            for (const { message } of hits) {
+                message.delivery = { ...message.delivery, state: "failed", error: "The extension stopped before this comment was sent. Resend it.", updatedAt: nowIso() };
+            }
             return hits.length ? { review, value: hits.map((h) => h.message.messageId) } : { write: false, value: [] };
         });
         if (ids.length) this.changed(reviewId, "delivery");
@@ -798,8 +835,11 @@ export class ReviewService extends EventEmitter {
         };
     }
 
+    // The agent's view of a review. Drafts are still held by the reviewer, so only their count is shown.
     summarize(review, { threadId, includeResolved = false, maxBody = 2000 } = {}) {
-        const threads = review.threads.filter((t) => (threadId ? t.threadId === threadId : includeResolved || t.status === "active"));
+        const isDraft = (m) => m.author === "user" && m.delivery?.state === "draft";
+        const visible = review.threads.filter((t) => t.messages.some((m) => !isDraft(m)));
+        const threads = visible.filter((t) => (threadId ? t.threadId === threadId : includeResolved || t.status === "active"));
         return {
             reviewId: review.reviewId,
             title: review.title,
@@ -811,10 +851,10 @@ export class ReviewService extends EventEmitter {
             currentRevisionId: review.currentRevisionId,
             git: review.git,
             counts: {
-                total: review.threads.length,
-                active: review.threads.filter((t) => t.status === "active").length,
+                total: visible.length,
+                active: visible.filter((t) => t.status === "active").length,
                 awaitingAgent: allMessages(review).filter((e) => ["queued", "processing", "failed", "no-reply"].includes(e.message.delivery?.state)).length,
-                drafts: allMessages(review).filter((e) => e.message.delivery?.state === "draft").length,
+                drafts: allMessages(review).filter((e) => isDraft(e.message)).length,
             },
             threads: threads.map((t) => ({
                 threadId: t.threadId,
@@ -822,7 +862,7 @@ export class ReviewService extends EventEmitter {
                 status: t.status,
                 location: t.location,
                 originalLocation: t.anchor ? { revisionId: t.anchor.revisionId, path: t.anchor.path, side: t.anchor.side, startLine: t.anchor.startLine, endLine: t.anchor.endLine } : null,
-                messages: t.messages.map((m) => ({
+                messages: t.messages.filter((m) => !isDraft(m)).map((m) => ({
                     messageId: m.messageId,
                     author: m.author,
                     createdAt: m.createdAt,

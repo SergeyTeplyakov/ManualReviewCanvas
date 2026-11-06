@@ -196,6 +196,11 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
 
         if (req.method !== "POST") throw new HttpError(405, "invalid_input", "Method not allowed.");
         if (!req.headers["x-mr-token"]) throw new HttpError(403, "forbidden", "Token header required.");
+        // The page names the review it is showing; after a scope switch an older page must not write into the new review.
+        const pageReview = req.headers["x-mr-review"];
+        if (pageReview !== undefined && pageReview !== reviewId) {
+            throw new HttpError(409, "conflict", "This canvas now shows a different review. Your comment was not saved; reload and try again.");
+        }
         const body = await readJsonBody(req);
 
         if (parts[0] === "threads" && parts.length === 1) {

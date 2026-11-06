@@ -1,5 +1,6 @@
 // Delivers user review comments to the agent conversation and tracks their lifecycle:
 // saving -> queued -> processing -> replied | no-reply, or failed (retryable).
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 
@@ -15,14 +16,17 @@ export class Delivery extends EventEmitter {
      * @param {(msg: string, level?: string) => void} p.log
      * @param {() => Iterable<string>} p.reviewIds reviews to settle when the agent goes idle
      * @param {(repoRoot: string) => Promise<string>} [p.learning] guideline-learning mode for a repository; failures fall back to off
+     * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off" }) {
+    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off", sessionId = () => undefined }) {
         super();
         this.service = service;
         this.send = send;
         this.log = log;
         this.reviewIds = reviewIds;
         this.learning = learning;
+        this.sessionId = sessionId;
+        this.fallbackOwner = `delivery-${randomUUID()}`;
         this.busy = null;
         this.bySessionMessageId = new Map();
         this.seenSessionMessageIds = new Set();
@@ -107,9 +111,18 @@ export class Delivery extends EventEmitter {
         }
         // The user.message event can arrive before send() resolves.
         if (sessionMessageId && this.seenSessionMessageIds.delete(sessionMessageId)) {
-            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, { state: "processing", processingAt: nowIso() }, c);
+            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, this.processingPatch(), c);
         }
         return { delivered: true, sessionMessageId };
+    }
+
+    // Several conversations can share a review, so a processing comment records which one is working on it.
+    owner() {
+        return this.sessionId() || this.fallbackOwner;
+    }
+
+    processingPatch() {
+        return { state: "processing", processingAt: nowIso(), processedBy: this.owner() };
     }
 
     async onUserMessage(event) {
@@ -134,7 +147,7 @@ export class Delivery extends EventEmitter {
         }
         for (const target of targets) {
             this.touched.add(target.reviewId);
-            await this.service.setDelivery(target.reviewId, target.messageId, { state: "processing", processingAt: nowIso() }, target);
+            await this.service.setDelivery(target.reviewId, target.messageId, this.processingPatch(), target);
         }
     }
     setBusy(busy) {
@@ -148,7 +161,8 @@ export class Delivery extends EventEmitter {
         const ids = new Set([...this.touched, ...this.reviewIds()]);
         for (const reviewId of ids) {
             try {
-                await this.service.settleProcessing(reviewId);
+                await this.service.settleProcessing(reviewId, { sessionId: this.owner() });
+                await this.service.recoverAbandonedClaims(reviewId);
             } catch (err) {
                 this.log(`manual-review: settle failed for ${reviewId}: ${err?.message ?? err}`, "warning");
             }

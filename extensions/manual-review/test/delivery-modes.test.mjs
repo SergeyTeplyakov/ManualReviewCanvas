@@ -159,6 +159,20 @@ test("held comments stay drafts until the review is submitted, then are claimed 
     assert.deepEqual(await service.claimDrafts(reviewId), [], "a review is submitted once");
 });
 
+test("the review the agent reads leaves out held drafts but counts them", async () => {
+    const { service } = fresh();
+    const reviewId = await openReview(service);
+    await draftThread(service, reviewId, "a.cs", "Still deciding about this");
+    const sent = await service.createThread(reviewId, { kind: "file", path: "b.cs", body: "Sent right away", author: "user" });
+    await draftReply(service, reviewId, sent.thread.threadId, "Held follow-up");
+    const summary = service.summarize(await service.getReview(reviewId));
+    assert.deepEqual(summary.threads.map((t) => t.threadId), [sent.thread.threadId], "a thread holding only drafts is hidden");
+    assert.deepEqual(summary.threads[0].messages.map((m) => m.messageId), [sent.message.messageId], "a held reply is hidden");
+    assert.deepEqual([summary.counts.total, summary.counts.active, summary.counts.drafts], [1, 1, 2]);
+    const text = JSON.stringify(summary);
+    assert.ok(!text.includes("Still deciding") && !text.includes("Held follow-up"), "draft text never reaches the agent");
+});
+
 test("an agent reply answers every comment its thread received in the same submitted review, and never a draft", async () => {
     const { service } = fresh();
     const reviewId = await openReview(service);
