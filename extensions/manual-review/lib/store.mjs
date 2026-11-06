@@ -1,8 +1,8 @@
 // Durable review storage under ~/.copilot/extension-data/manual-review.
 // Writes are atomic (temp file + rename) and serialized per key so concurrent
 // UI posts and agent replies cannot lose each other's updates.
-import { mkdir, readFile, rename, writeFile, appendFile, unlink } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, writeFile, appendFile, unlink } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -80,6 +80,34 @@ export class Store {
         return path.join(this.root, "settings.json");
     }
 
+    // The exclusive file covers the entire transaction across provider processes.
+    // Never steal an old lock: a slow or suspended owner may still be writing.
+    async fileLock(key, fn) {
+        const directory = path.join(this.root, "locks");
+        await mkdir(directory, { recursive: true });
+        const file = path.join(directory, `${createHash("sha256").update(key).digest("hex")}.lock`);
+        const deadline = Date.now() + 10000;
+        let handle;
+        while (!handle) {
+            try {
+                handle = await open(file, "wx", 0o600);
+            } catch (err) {
+                if (err?.code !== "EEXIST") throw err;
+                if (Date.now() >= deadline) {
+                    throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all manual-review providers before removing this lock.`);
+                }
+                await sleep(25);
+            }
+        }
+        try {
+            await handle.writeFile(JSON.stringify({ pid: process.pid, key, createdAt: new Date().toISOString() }));
+            return await fn();
+        } finally {
+            await handle.close();
+            await withRetry(() => unlink(file));
+        }
+    }
+
     // Serializes async work per key; the callback always sees the latest committed state.
     async lock(key, fn) {
         const prev = this.locks.get(key) ?? Promise.resolve();
@@ -89,7 +117,7 @@ export class Store {
         this.locks.set(key, chained);
         await prev;
         try {
-            return await fn();
+            return await this.fileLock(key, fn);
         } finally {
             release();
             if (this.locks.get(key) === chained) this.locks.delete(key);

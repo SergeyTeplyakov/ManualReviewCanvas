@@ -27,47 +27,53 @@ export class Delivery extends EventEmitter {
         this.bySessionMessageId = new Map();
         this.seenSessionMessageIds = new Set();
         this.touched = new Set();
+        this.inFlight = new Map();
     }
 
-    async deliver(reviewId, threadId, messageId, instanceId, { retry = false } = {}) {
+    deliver(reviewId, threadId, messageId, instanceId, options = {}) {
+        const key = `${reviewId}:${messageId}`;
+        if (this.inFlight.has(key)) return this.inFlight.get(key);
+        const pending = this.deliverOnce(reviewId, threadId, messageId, instanceId, options)
+            .finally(() => this.inFlight.delete(key));
+        this.inFlight.set(key, pending);
+        return pending;
+    }
+
+    async deliverOnce(reviewId, threadId, messageId, instanceId, { retry = false } = {}) {
         this.touched.add(reviewId);
-        const ctx = await this.service.promptContext(reviewId, threadId);
-        const message = ctx.thread.messages.find((m) => m.messageId === messageId);
-        if (!message || message.author !== "user") throw new Error(`Message ${messageId} is not a user message in ${threadId}.`);
-        const attempts = (message.delivery?.attempts ?? 0) + 1;
-        if (retry) {
-            await this.service.setDelivery(reviewId, messageId, { state: "saving", error: null }, { force: true });
-        }
+        const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry });
+        if (!claim) return { delivered: false, skipped: true };
 
-        let learning = "off";
-        try {
-            learning = await this.learning(ctx.review.repoRoot);
-        } catch (err) {
-            this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
-        }
-
-        const { prompt, displayPrompt } = buildCommentPrompt({ ...ctx, message, instanceId, learning });
         let sessionMessageId;
         try {
+            const ctx = await this.service.promptContext(reviewId, threadId);
+            const message = ctx.thread.messages.find((m) => m.messageId === messageId);
+            let learning = "off";
+            try {
+                learning = await this.learning(ctx.review.repoRoot);
+            } catch (err) {
+                this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+            }
+
+            const { prompt, displayPrompt } = buildCommentPrompt({ ...ctx, message, instanceId, learning });
             sessionMessageId = await this.send({ prompt, displayPrompt, mode: "enqueue" });
         } catch (err) {
             this.log(`manual-review: failed to deliver ${messageId}: ${err?.message ?? err}`, "warning");
-            await this.service.setDelivery(reviewId, messageId, { state: "failed", attempts, error: String(err?.message ?? err) });
+            await this.service.setDelivery(reviewId, messageId, { state: "failed", error: String(err?.message ?? err) }, claim);
             return { delivered: false, error: String(err?.message ?? err) };
         }
 
-        const target = { reviewId, messageId };
+        const target = { reviewId, messageId, attemptId: claim.attemptId };
         if (sessionMessageId) this.bySessionMessageId.set(sessionMessageId, target);
         await this.service.setDelivery(reviewId, messageId, {
             state: "queued",
-            attempts,
             sessionMessageId: sessionMessageId ?? null,
             queuedAt: nowIso(),
             error: null,
-        });
+        }, claim);
         // The user.message event can arrive before send() resolves.
         if (sessionMessageId && this.seenSessionMessageIds.delete(sessionMessageId)) {
-            await this.service.setDelivery(reviewId, messageId, { state: "processing", processingAt: nowIso() });
+            await this.service.setDelivery(reviewId, messageId, { state: "processing", processingAt: nowIso() }, claim);
         }
         return { delivered: true, sessionMessageId };
     }
@@ -87,7 +93,7 @@ export class Delivery extends EventEmitter {
             return;
         }
         this.touched.add(target.reviewId);
-        await this.service.setDelivery(target.reviewId, target.messageId, { state: "processing", processingAt: nowIso() });
+        await this.service.setDelivery(target.reviewId, target.messageId, { state: "processing", processingAt: nowIso() }, target);
     }
 
     setBusy(busy) {

@@ -6,8 +6,8 @@ function normalize(line) {
     return line.replace(/\s+$/, "");
 }
 
-function squash(line) {
-    return line.replace(/\s+/g, "");
+function trimIndentation(line) {
+    return line.trim();
 }
 
 function findMatches(fileLines, needle, map) {
@@ -46,7 +46,7 @@ export function relocate(anchor, hintLine, fileLines) {
     const needle = anchor.selectedLines ?? [];
     const meaningful = needle.some((l) => l.trim() !== "");
     if (meaningful) {
-        for (const map of [normalize, squash]) {
+        for (const map of [normalize, trimIndentation]) {
             const found = findMatches(fileLines, needle, map);
             if (found.length > 0) {
                 const start = nearest(found, hint);

@@ -2,7 +2,8 @@
 // GIT_OPTIONAL_LOCKS=0 keeps diff/status from rewriting the index.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
 
@@ -70,17 +71,37 @@ function isBinary(buffer) {
 }
 
 async function readUntracked(repoRoot, relPath) {
-    const full = safeJoin(repoRoot, relPath);
-    const info = await stat(full);
-    if (!info.isFile()) return null;
-    if (info.size > MAX_UNTRACKED_BYTES) {
+    const result = await readRepoFile(repoRoot, relPath, MAX_UNTRACKED_BYTES);
+    if (!result) return null;
+    if (result.tooLarge) {
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], note: "File too large to display" };
     }
-    const buffer = await readFile(full);
+    const { buffer } = result;
     if (isBinary(buffer)) {
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [] };
     }
     return synthesizeAddedFile(relPath, buffer.toString("utf8"));
+}
+
+// Read symlinks as Git does (their target text), never as the target's contents.
+// Resolve and check the parent too, so junctions/directory symlinks cannot escape.
+async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
+    const full = safeJoin(repoRoot, relPath);
+    const root = await realpath(repoRoot);
+    const parent = await realpath(path.dirname(full));
+    const checked = safeJoin(root, path.relative(root, path.join(parent, path.basename(full))));
+    const info = await lstat(checked);
+    if (info.isSymbolicLink()) return { buffer: Buffer.from(await readlink(checked)) };
+    if (!info.isFile()) return null;
+    const resolved = await realpath(checked);
+    safeJoin(root, path.relative(root, resolved));
+    const handle = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+        if ((await handle.stat()).size > maxBytes) return { tooLarge: true };
+        return { buffer: await handle.readFile() };
+    } finally {
+        await handle.close();
+    }
 }
 
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
@@ -107,7 +128,10 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         const list = await runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspec]);
         const untracked = list.stdout.split("\0").filter(Boolean).sort();
         for (const rel of untracked) {
-            const entry = await readUntracked(repoRoot, rel).catch(() => null);
+            const entry = await readUntracked(repoRoot, rel).catch((err) => {
+                if (err?.code === "ENOENT") return null;
+                throw err;
+            });
             if (!entry) continue;
             files.push(entry);
             hash.update("\0untracked\0").update(rel).update("\0").update(JSON.stringify(entry.hunks));
@@ -142,9 +166,11 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
 
 export async function readWorkingFile(repoRoot, relPath) {
     try {
-        return (await readFile(safeJoin(repoRoot, relPath), "utf8")).split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
-    } catch {
-        return null;
+        const result = await readRepoFile(repoRoot, relPath);
+        return result ? result.buffer.toString("utf8").split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)) : null;
+    } catch (err) {
+        if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return null;
+        throw err;
     }
 }
 

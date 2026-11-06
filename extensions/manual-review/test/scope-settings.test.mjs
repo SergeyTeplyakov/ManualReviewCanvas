@@ -454,10 +454,11 @@ test("an unreadable or hand-edited settings file never blocks reading the effect
 
 test("Delivery hands the repository's learning mode to the prompt and falls back to off when it cannot be read", async () => {
     const { service } = fresh();
-    const { reviewId, thread, message } = await commentThread(service);
+    const { reviewId, thread } = await commentThread(service);
     const { repoRoot } = await service.getReview(reviewId);
 
     const deliver = async (learning) => {
+        const { message } = await service.addMessage(reviewId, thread.threadId, { body: "Check this preference", author: "user" });
         const sent = [];
         const logs = [];
         const delivery = new Delivery({
@@ -469,7 +470,7 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
             log: (text, level) => logs.push({ text, level }),
             ...(learning ? { learning } : {}),
         });
-        await delivery.deliver(reviewId, thread.threadId, message.messageId, "inst", { retry: true });
+        await delivery.deliver(reviewId, thread.threadId, message.messageId, "inst");
         return { prompt: sent[0].prompt, logs };
     };
     const off = /Guideline learning is off for this repository/;

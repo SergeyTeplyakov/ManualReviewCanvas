@@ -58,6 +58,13 @@ function defaultTitle({ branch, base, scope }) {
     return scope === "pending" ? `${branch}${PENDING_SUFFIX}` : `${branch} vs ${base}`;
 }
 
+function applyOpenOptions(review, input) {
+    if (input.title) review.title = input.title;
+    if (input.includeUntracked !== undefined) review.includeUntracked = input.includeUntracked;
+    if (input.context !== undefined) review.contextLines = input.context;
+    return review;
+}
+
 // A default title is regenerated for the target scope; a custom title is carried over with the pending suffix toggled.
 function siblingTitle(source, targetScope) {
     const origin = source.originBranch ?? source.branch;
@@ -242,11 +249,12 @@ export class ReviewService extends EventEmitter {
         if (input.reviewId) {
             const existing = await this.getReview(input.reviewId);
             const switching = requestedScope !== null && requestedScope !== scopeOf(existing);
-            const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope) : input.reviewId;
-            if (input.title) {
-                await this.store.updateReview(reviewId, (r) => ({ review: Object.assign(r, { title: input.title }) }));
+            const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope, { base: input.base }) : input.reviewId;
+            const hasOptions = input.title || input.includeUntracked !== undefined || input.context !== undefined;
+            if (hasOptions) {
+                await this.store.updateReview(reviewId, (r) => ({ review: applyOpenOptions(r, input) }));
             }
-            if (!switching) await this.refresh(reviewId);
+            if (!switching || hasOptions) await this.refresh(reviewId);
             return reviewId;
         }
 
@@ -256,17 +264,16 @@ export class ReviewService extends EventEmitter {
         } catch (err) {
             throw invalid(`Not a git repository: ${input.repoPath || cwd} (${err.message})`);
         }
-        const base = input.base || (await this.git.defaultBase(repoRoot));
+        const scope = requestedScope ?? "all";
+        const base = input.base || (scope === "pending" ? null : await this.git.defaultBase(repoRoot));
         const branch = (await this.git.runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
         const paths = input.paths ?? [];
         const exclude = input.exclude ?? [];
-        const scope = requestedScope ?? "all";
         const reviewId = computeReviewId({ repoRoot, branch, base, paths, exclude, scope });
 
         await this.store.updateReview(reviewId, (existing) => {
             if (existing) {
-                if (input.title && existing.title !== input.title) return { review: Object.assign(existing, { title: input.title }) };
-                return { write: false };
+                return { review: applyOpenOptions(existing, input) };
             }
             return {
                 review: newReviewRecord({
@@ -288,27 +295,32 @@ export class ReviewService extends EventEmitter {
     }
 
     // Opens the other-scope review of the same repository, branch, base, and pathspecs, creating it on first use.
-    async openSibling(reviewId, scope) {
+    async openSibling(reviewId, scope, { base: requestedBase } = {}) {
         const target = checkScope(scope);
         const source = await this.getReview(reviewId);
         if (target === scopeOf(source)) return reviewId;
+        if (source.siblingReviewId && !requestedBase) {
+            await this.refresh(source.siblingReviewId);
+            return source.siblingReviewId;
+        }
+        const base = requestedBase || source.base || (target === "all" ? await this.git.defaultBase(source.repoRoot) : null);
         const originBranch = source.originBranch ?? source.branch;
         const siblingId = computeReviewId({
             repoRoot: source.repoRoot,
             branch: originBranch,
-            base: source.base,
+            base,
             paths: source.paths,
             exclude: source.exclude,
             scope: target,
         });
         await this.store.updateReview(siblingId, (existing) => {
-            if (existing) return { write: false };
+            if (existing) return { review: Object.assign(existing, { siblingReviewId: reviewId }) };
             return {
-                review: newReviewRecord({
+                review: { ...newReviewRecord({
                     reviewId: siblingId,
-                    title: siblingTitle(source, target),
+                    title: siblingTitle({ ...source, base }, target),
                     repoRoot: source.repoRoot,
-                    base: source.base,
+                    base,
                     paths: source.paths,
                     exclude: source.exclude,
                     includeUntracked: source.includeUntracked,
@@ -316,10 +328,11 @@ export class ReviewService extends EventEmitter {
                     branch: source.branch,
                     originBranch,
                     scope: target,
-                }),
+                }), siblingReviewId: reviewId },
             };
         });
         await this.refresh(siblingId);
+        await this.store.updateReview(reviewId, (review) => ({ review: Object.assign(review, { siblingReviewId: siblingId }) }));
         return siblingId;
     }
 
@@ -472,11 +485,13 @@ export class ReviewService extends EventEmitter {
         const rev = revisionId ?? review.currentRevisionId;
         const snapshot = await this.store.readSnapshot(review.reviewId, rev);
         const file = snapshot?.files.find((f) => f.path === filePath) ?? null;
+        if (!snapshot) throw notFound(`Revision ${rev} not found for review ${review.reviewId}.`);
 
         if (kind === "file") {
             const base = { revisionId: rev, path: filePath, oldPath: file?.oldPath ?? null };
             return { anchor: base, location: { revisionId: rev, path: filePath, state: "current" } };
         }
+        if (!file) throw notFound(`${filePath} is not part of revision ${rev}.`);
 
         const s = side === "old" ? "old" : "new";
         checkLine(startLine, "startLine");
@@ -488,8 +503,8 @@ export class ReviewService extends EventEmitter {
         let selected = file ? selectedLines(file, s, startLine, end) : [];
         if (selected.length !== end - startLine + 1) {
             const content = s === "old"
-                ? await this.git.readCommitFile(review.repoRoot, snapshot?.baseCommit ?? review.git?.baseCommit, file?.oldPath ?? filePath)
-                : await this.git.readWorkingFile(review.repoRoot, filePath);
+                ? await this.git.readCommitFile(review.repoRoot, snapshot.baseCommit, file.oldPath ?? filePath)
+                : await this.revisionLines(review.reviewId, rev, filePath);
             if (!content || end > content.length) throw invalid(`Lines ${startLine}-${end} are outside ${filePath} (${s} side).`);
             selected = content.slice(startLine - 1, end);
         }
@@ -617,17 +632,36 @@ export class ReviewService extends EventEmitter {
         return thread;
     }
 
-    // Applies a delivery transition; later states win unless `force` (used by retry).
+    // Claim before doing any async prompt work or sending; only one provider may send an attempt.
+    async claimDelivery(reviewId, threadId, messageId, { retry = false } = {}) {
+        const claim = await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            const message = findThread(review, threadId).messages.find((m) => m.messageId === messageId);
+            if (!message || message.author !== "user") throw invalid(`Message ${messageId} is not a user message in ${threadId}.`);
+            const current = message.delivery;
+            const initial = current?.state === "saving" && !current.attempts;
+            if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state))) return { write: false, value: null };
+            const attempt = { attemptId: randomUUID(), attempts: (current.attempts ?? 0) + 1 };
+            message.delivery = { state: "saving", ...attempt, error: null, updatedAt: nowIso() };
+            return { review, value: attempt };
+        });
+        if (claim) this.changed(reviewId, "delivery");
+        return claim;
+    }
+
+    // Applies a delivery transition; later states win within the claimed attempt.
     // Non-state fields (e.g. sessionMessageId) are merged even when the state change is ignored.
-    async setDelivery(reviewId, messageId, patch, { force = false } = {}) {
+    async setDelivery(reviewId, messageId, patch, { attemptId } = {}) {
         const applied = await this.store.updateReview(reviewId, (review) => {
             if (!review) return { write: false, value: false };
             const entry = allMessages(review).find((e) => e.message.messageId === messageId);
             if (!entry || !entry.message.delivery) return { write: false, value: false };
             const current = entry.message.delivery;
+            if (attemptId && current.attemptId !== attemptId) return { write: false, value: false };
             const { state, ...rest } = patch;
-            const allowState = Boolean(state) && (force || (current.state !== "replied"
-                && (state === "failed" || DELIVERY_RANK[state] >= DELIVERY_RANK[current.state])));
+            if (state === "failed" && !["saving", "failed"].includes(current.state)) return { write: false, value: false };
+            const allowState = Boolean(state) && current.state !== "replied"
+                && (state === "failed" || DELIVERY_RANK[state] >= DELIVERY_RANK[current.state]);
             if (!allowState && Object.keys(rest).length === 0) return { write: false, value: false };
             entry.message.delivery = { ...current, ...rest, ...(allowState ? { state } : {}), updatedAt: nowIso() };
             return { review, value: true };
@@ -655,6 +689,14 @@ export class ReviewService extends EventEmitter {
         return { review, thread: entry.thread, message: entry.message };
     }
 
+    async revisionLines(reviewId, revisionId, filePath) {
+        const content = await this.getFileContent(reviewId, revisionId, filePath);
+        if (!content.available) {
+            throw new ReviewError("conflict", `Cannot use ${filePath} from revision ${revisionId}: ${content.reason}. Refresh the review and check the selection before retrying.`);
+        }
+        return content.lines;
+    }
+
     // Everything the agent prompt needs for one message, resolved against the current revision.
     async promptContext(reviewId, threadId) {
         const review = await this.getReview(reviewId);
@@ -663,7 +705,7 @@ export class ReviewService extends EventEmitter {
         let selected = null;
         const loc = thread.location;
         if (loc && (thread.kind === "line" || thread.kind === "change") && loc.state !== "outdated") {
-            const snapshot = await this.store.readSnapshot(reviewId, review.currentRevisionId);
+            const snapshot = await this.store.readSnapshot(reviewId, loc.revisionId);
             const file = snapshot?.files.find((f) => f.path === loc.path);
             if (file) {
                 excerpt = hunkExcerpt(file, loc.side, loc.startLine, loc.endLine);
@@ -671,8 +713,8 @@ export class ReviewService extends EventEmitter {
             }
             if (!selected || selected.length !== loc.endLine - loc.startLine + 1) {
                 const content = loc.side === "old"
-                    ? await this.git.readCommitFile(review.repoRoot, review.git?.baseCommit, thread.anchor.oldPath ?? loc.path)
-                    : await this.git.readWorkingFile(review.repoRoot, loc.path);
+                    ? await this.git.readCommitFile(review.repoRoot, snapshot?.baseCommit, thread.anchor.oldPath ?? loc.path)
+                    : await this.revisionLines(reviewId, loc.revisionId, loc.path);
                 selected = content ? content.slice(loc.startLine - 1, loc.endLine) : selected;
             }
         }

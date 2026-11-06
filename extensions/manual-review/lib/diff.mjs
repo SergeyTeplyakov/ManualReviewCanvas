@@ -10,7 +10,17 @@ function stripCr(line) {
 function unquotePath(value) {
     let p = value.replace(/\t+$/, "");
     if (p.startsWith('"') && p.endsWith('"')) {
-        p = p.slice(1, -1).replace(/\\(["\\])/g, "$1").replace(/\\t/g, "\t").replace(/\\n/g, "\n");
+        p = p.slice(1, -1);
+        const escapes = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\" };
+        const chunks = [];
+        let start = 0;
+        for (const match of p.matchAll(/\\([0-7]{1,3}|["\\abfnrtv])/g)) {
+            chunks.push(Buffer.from(p.slice(start, match.index)));
+            chunks.push(/^[0-7]/.test(match[1]) ? Buffer.from([parseInt(match[1], 8)]) : Buffer.from(escapes[match[1]]));
+            start = match.index + match[0].length;
+        }
+        chunks.push(Buffer.from(p.slice(start)));
+        p = Buffer.concat(chunks).toString("utf8");
     }
     return p;
 }
@@ -67,10 +77,10 @@ export function parseUnifiedDiff(text) {
             file = newFile();
             files.push(file);
             hunk = null;
-            const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line);
+            const m = /^diff --git ("(?:[^"\\]|\\.)*"|a\/.*) ("(?:[^"\\]|\\.)*"|b\/.*)$/.exec(line);
             if (m) {
-                file.oldPath = unquotePath(m[1]);
-                file.path = unquotePath(m[2]);
+                file.oldPath = stripSidePrefix(unquotePath(m[1]));
+                file.path = stripSidePrefix(unquotePath(m[2]));
             }
             continue;
         }
