@@ -1,6 +1,6 @@
 # Manual Review Canvas
 
-**Review your agent's changes like a PR, before there is a PR.** A canvas and skill for the GitHub Copilot app.
+A human-led review canvas for the GitHub Copilot app. Inspect local changes, leave inline feedback, and iterate with your agent.
 
 ```bash
 copilot plugin marketplace add SergeyTeplyakov/ManualReviewCanvas
