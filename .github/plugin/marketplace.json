@@ -1,0 +1,18 @@
+{
+  "name": "manual-review-canvas",
+  "owner": {
+    "name": "Sergey Teplyakov"
+  },
+  "metadata": {
+    "description": "A code-review canvas for the GitHub Copilot app. Inspect local diffs, leave inline comments, and iterate with your coding agent before opening a PR.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "manual-review-canvas",
+      "description": "A code-review canvas for the GitHub Copilot app. Inspect local diffs, leave inline comments, and iterate with your coding agent before opening a PR.",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}
