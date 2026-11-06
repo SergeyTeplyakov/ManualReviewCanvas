@@ -10,6 +10,9 @@ import { hunkExcerpt, selectedLines } from "./diff.mjs";
 export const THREAD_KINDS = ["overview", "file", "change", "line"];
 export const THREAD_STATUSES = ["active", "resolved", "wontfix", "closed"];
 export const OUTCOMES = ["answered", "changed", "blocked", "disagreed", "needs-input"];
+export const LESSON_STATUSES = ["proposed", "saved", "declined"];
+export const SCOPES = ["all", "pending"];
+const PENDING_SUFFIX = " (pending changes)";
 const MAX_BODY = 20000;
 const MAX_RANGE = 2000;
 const MAX_ANCHOR_LINES = 400;
@@ -29,13 +32,65 @@ function slug(value) {
     return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^[-.]+|[-.]+$/g, "");
 }
 
-export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [] }) {
-    const hash = createHash("sha256")
-        .update([path.resolve(repoRoot).toLowerCase(), branch, base, [...paths].sort().join(","), [...exclude].sort().join(",")].join("|"))
-        .digest("hex")
-        .slice(0, 8);
-    const readable = slug(`${path.basename(repoRoot)}-${branch}-vs-${base}`).slice(0, 80) || "review";
+// "all" reviews the whole branch or PR (working tree vs merge-base); "pending" reviews only uncommitted work (working tree vs HEAD).
+export function checkScope(value) {
+    if (value == null) return "all";
+    if (!SCOPES.includes(value)) throw invalid(`scope must be one of ${SCOPES.join(", ")}.`);
+    return value;
+}
+
+// Reviews saved before scopes existed have no scope field and are "all" reviews.
+export function scopeOf(review) {
+    return review?.scope === "pending" ? "pending" : "all";
+}
+
+// The "all" id must stay identical to the pre-scope computation so existing reviews keep their threads.
+export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [], scope = "all" }) {
+    const parts = [path.resolve(repoRoot).toLowerCase(), branch, base, [...paths].sort().join(","), [...exclude].sort().join(",")];
+    if (scope === "pending") parts.push("pending");
+    const hash = createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 8);
+    const label = scope === "pending" ? `${path.basename(repoRoot)}-${branch}-pending` : `${path.basename(repoRoot)}-${branch}-vs-${base}`;
+    const readable = slug(label).slice(0, 80) || "review";
     return `${readable}-${hash}`;
+}
+
+function defaultTitle({ branch, base, scope }) {
+    return scope === "pending" ? `${branch}${PENDING_SUFFIX}` : `${branch} vs ${base}`;
+}
+
+// A default title is regenerated for the target scope; a custom title is carried over with the pending suffix toggled.
+function siblingTitle(source, targetScope) {
+    const origin = source.originBranch ?? source.branch;
+    if (source.title === defaultTitle({ branch: origin, base: source.base, scope: scopeOf(source) })) {
+        return defaultTitle({ branch: source.branch, base: source.base, scope: targetScope });
+    }
+    const hasSuffix = source.title.endsWith(PENDING_SUFFIX);
+    if (targetScope === "pending") return hasSuffix ? source.title : `${source.title}${PENDING_SUFFIX}`;
+    return hasSuffix ? source.title.slice(0, -PENDING_SUFFIX.length) : source.title;
+}
+
+// originBranch is the branch the id was computed from; branch is the live label refreshed on every capture.
+function newReviewRecord({ reviewId, title, repoRoot, base, paths, exclude, includeUntracked, contextLines, branch, originBranch = branch, scope }) {
+    return {
+        schema: 1,
+        reviewId,
+        title,
+        repoRoot,
+        base,
+        paths,
+        exclude,
+        includeUntracked,
+        contextLines,
+        branch,
+        originBranch,
+        scope,
+        git: null,
+        currentRevisionId: null,
+        revisions: [],
+        threads: [],
+        lessons: [],
+        createdAt: nowIso(),
+    };
 }
 
 function nowIso() {
@@ -66,6 +121,44 @@ function findThread(review, threadId) {
     const thread = review.threads.find((t) => t.threadId === threadId);
     if (!thread) throw notFound(`Thread ${threadId} not found in review ${review.reviewId}.`);
     return thread;
+}
+
+const normalizeRule = (rule) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
+
+// Records a guideline the agent reported. A decision on a guideline proposed earlier in the thread (by lessonId,
+// or by the same rule text) updates that lesson in place instead of adding a duplicate. Lessons without a
+// status are legacy records and count as saved.
+function applyLesson(review, { reviewId, threadId, messageId }, input) {
+    const status = input.status ?? "saved";
+    const rule = typeof input.rule === "string" ? input.rule.trim() : "";
+    let lesson;
+    if (input.lessonId) {
+        lesson = review.lessons.find((l) => l.lessonId === input.lessonId && l.threadId === threadId);
+        if (!lesson) throw notFound(`Lesson ${input.lessonId} not found in thread ${threadId}.`);
+    } else {
+        lesson = review.lessons.find((l) => l.threadId === threadId && (l.status ?? "saved") === "proposed" && normalizeRule(l.rule) === normalizeRule(rule));
+    }
+    if (!lesson) {
+        lesson = {
+            lessonId: `l-${randomUUID().slice(0, 8)}`,
+            reviewId,
+            threadId,
+            messageId,
+            scope: input.scope ?? "repo",
+            rule,
+            status,
+            savedTo: status === "saved" ? input.savedTo ?? null : null,
+            createdAt: nowIso(),
+        };
+        review.lessons.push(lesson);
+        return lesson;
+    }
+    if (rule) lesson.rule = rule;
+    if (input.scope) lesson.scope = input.scope;
+    lesson.status = status;
+    lesson.savedTo = status === "saved" ? input.savedTo ?? lesson.savedTo ?? null : null;
+    lesson.updatedAt = nowIso();
+    return lesson;
 }
 
 function matchesRevision(file, oldLines, newLines) {
@@ -143,14 +236,18 @@ export class ReviewService extends EventEmitter {
     }
 
     // Creates the review on first open, then captures a fresh snapshot.
+    // An explicit scope that differs from an existing review's scope opens its sibling review instead.
     async ensureReview(input = {}, { cwd = process.cwd() } = {}) {
+        const requestedScope = input.scope == null ? null : checkScope(input.scope);
         if (input.reviewId) {
-            await this.getReview(input.reviewId);
+            const existing = await this.getReview(input.reviewId);
+            const switching = requestedScope !== null && requestedScope !== scopeOf(existing);
+            const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope) : input.reviewId;
             if (input.title) {
-                await this.store.updateReview(input.reviewId, (r) => ({ review: Object.assign(r, { title: input.title }) }));
+                await this.store.updateReview(reviewId, (r) => ({ review: Object.assign(r, { title: input.title }) }));
             }
-            await this.refresh(input.reviewId);
-            return input.reviewId;
+            if (!switching) await this.refresh(reviewId);
+            return reviewId;
         }
 
         let repoRoot;
@@ -163,7 +260,8 @@ export class ReviewService extends EventEmitter {
         const branch = (await this.git.runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
         const paths = input.paths ?? [];
         const exclude = input.exclude ?? [];
-        const reviewId = computeReviewId({ repoRoot, branch, base, paths, exclude });
+        const scope = requestedScope ?? "all";
+        const reviewId = computeReviewId({ repoRoot, branch, base, paths, exclude, scope });
 
         await this.store.updateReview(reviewId, (existing) => {
             if (existing) {
@@ -171,10 +269,9 @@ export class ReviewService extends EventEmitter {
                 return { write: false };
             }
             return {
-                review: {
-                    schema: 1,
+                review: newReviewRecord({
                     reviewId,
-                    title: input.title || `${branch} vs ${base}`,
+                    title: input.title || defaultTitle({ branch, base, scope }),
                     repoRoot,
                     base,
                     paths,
@@ -182,17 +279,48 @@ export class ReviewService extends EventEmitter {
                     includeUntracked: input.includeUntracked ?? true,
                     contextLines: input.context ?? 5,
                     branch,
-                    git: null,
-                    currentRevisionId: null,
-                    revisions: [],
-                    threads: [],
-                    lessons: [],
-                    createdAt: nowIso(),
-                },
+                    scope,
+                }),
             };
         });
         await this.refresh(reviewId);
         return reviewId;
+    }
+
+    // Opens the other-scope review of the same repository, branch, base, and pathspecs, creating it on first use.
+    async openSibling(reviewId, scope) {
+        const target = checkScope(scope);
+        const source = await this.getReview(reviewId);
+        if (target === scopeOf(source)) return reviewId;
+        const originBranch = source.originBranch ?? source.branch;
+        const siblingId = computeReviewId({
+            repoRoot: source.repoRoot,
+            branch: originBranch,
+            base: source.base,
+            paths: source.paths,
+            exclude: source.exclude,
+            scope: target,
+        });
+        await this.store.updateReview(siblingId, (existing) => {
+            if (existing) return { write: false };
+            return {
+                review: newReviewRecord({
+                    reviewId: siblingId,
+                    title: siblingTitle(source, target),
+                    repoRoot: source.repoRoot,
+                    base: source.base,
+                    paths: source.paths,
+                    exclude: source.exclude,
+                    includeUntracked: source.includeUntracked,
+                    contextLines: source.contextLines,
+                    branch: source.branch,
+                    originBranch,
+                    scope: target,
+                }),
+            };
+        });
+        await this.refresh(siblingId);
+        return siblingId;
     }
 
     // Coalesces overlapping refreshes; a refresh requested mid-capture triggers one more pass.
@@ -230,6 +358,7 @@ export class ReviewService extends EventEmitter {
                 exclude: before.exclude,
                 includeUntracked: before.includeUntracked,
                 contextLines: before.contextLines,
+                scope: scopeOf(before),
             });
         } catch (err) {
             throw new ReviewError("git_error", err.message);
@@ -428,11 +557,13 @@ export class ReviewService extends EventEmitter {
         }
         const lessonsInput = Array.isArray(input.lessons) ? input.lessons : [];
         for (const l of lessonsInput) {
-            if (!l || typeof l.rule !== "string" || !l.rule.trim()) throw invalid("Each lesson needs a non-empty rule.");
+            const hasRule = typeof l?.rule === "string" && l.rule.trim();
+            if (!l || (!hasRule && !l.lessonId)) throw invalid("Each lesson needs a non-empty rule or the lessonId of an existing guideline.");
             if (l.scope && !["repo", "personal"].includes(l.scope)) throw invalid("lesson.scope must be repo or personal.");
+            if (l.status != null && !LESSON_STATUSES.includes(l.status)) throw invalid(`lesson.status must be one of ${LESSON_STATUSES.join(", ")}.`);
         }
 
-        const newLessons = [];
+        const touchedLessons = new Map();
         const result = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const dup = findDuplicate(review, input.clientRequestId);
@@ -461,25 +592,15 @@ export class ReviewService extends EventEmitter {
                 if (target?.delivery) target.delivery = { ...target.delivery, state: "replied", repliedAt: nowIso() };
                 message.lessonIds = [];
                 for (const l of lessonsInput) {
-                    const lesson = {
-                        lessonId: `l-${randomUUID().slice(0, 8)}`,
-                        reviewId,
-                        threadId,
-                        messageId: message.messageId,
-                        scope: l.scope ?? "repo",
-                        rule: l.rule.trim(),
-                        savedTo: l.savedTo ?? null,
-                        createdAt: nowIso(),
-                    };
-                    review.lessons.push(lesson);
-                    message.lessonIds.push(lesson.lessonId);
-                    newLessons.push(lesson);
+                    const lesson = applyLesson(review, { reviewId, threadId, messageId: message.messageId }, l);
+                    if (!message.lessonIds.includes(lesson.lessonId)) message.lessonIds.push(lesson.lessonId);
+                    touchedLessons.set(lesson.lessonId, { ...lesson });
                 }
             }
             thread.messages.push(message);
             return { review, value: { thread, message, duplicate: false } };
         });
-        for (const lesson of newLessons) await this.store.appendLesson(lesson);
+        for (const lesson of touchedLessons.values()) await this.store.appendLesson(lesson);
         this.changed(reviewId, "message");
         return result;
     }
@@ -576,6 +697,7 @@ export class ReviewService extends EventEmitter {
             repoRoot: review.repoRoot,
             branch: review.branch,
             base: review.base,
+            scope: scopeOf(review),
             currentRevisionId: review.currentRevisionId,
             git: review.git,
             counts: {
@@ -598,7 +720,7 @@ export class ReviewService extends EventEmitter {
                     outcome: m.outcome,
                 })),
             })),
-            lessons: review.lessons,
+            lessons: review.lessons.map((l) => ({ ...l, status: l.status ?? "saved" })),
         };
     }
 }

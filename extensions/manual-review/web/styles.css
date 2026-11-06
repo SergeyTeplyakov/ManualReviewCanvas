@@ -464,6 +464,7 @@ table.lessons-table th { color: var(--mr-muted); font-weight: 600; font-size: 0.
 
 #toast {
     position: fixed;
+    z-index: 200;
     right: 16px;
     bottom: 16px;
     max-width: 420px;
@@ -475,3 +476,76 @@ table.lessons-table th { color: var(--mr-muted); font-weight: 600; font-size: 0.
 }
 #toast.error { background: var(--mr-red); color: #fff; }
 .banner { padding: 6px 10px; border: 1px solid var(--mr-yellow); color: var(--mr-yellow); border-radius: var(--mr-radius); margin-bottom: 10px; }
+
+/* Review scope toggle: a two-button segmented control in the top bar. */
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: var(--mr-radius) 0 0 var(--mr-radius); margin-left: 0; }
+.seg button:last-child { border-radius: 0 var(--mr-radius) var(--mr-radius) 0; }
+.seg button:hover { position: relative; z-index: 1; }
+.seg button[aria-pressed="true"] { position: relative; z-index: 1; background: var(--mr-accent-muted); border-color: var(--mr-accent); color: var(--mr-accent); }
+
+.empty-diff { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+#side .side-empty { padding: 4px 12px 8px; color: var(--mr-muted); }
+
+/* First-use notice asking how to learn from review feedback. */
+#banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--mr-border);
+    background: var(--mr-accent-muted);
+}
+#banner[hidden] { display: none; }
+#banner .banner-text { flex: 1 1 320px; min-width: 0; }
+#banner .banner-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* Guideline status on lessons. */
+.badge.lesson-proposed { border-color: var(--mr-yellow); color: var(--mr-yellow); }
+.badge.lesson-saved { border-color: var(--mr-green); color: var(--mr-green); }
+.badge.lesson-declined { color: var(--mr-muted); }
+
+/* Configure dialog. */
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.45);
+}
+.modal {
+    width: min(520px, 100%);
+    max-height: 100%;
+    overflow: auto;
+    padding: 16px 18px;
+    border: 1px solid var(--mr-border);
+    border-radius: var(--mr-radius);
+    background: var(--mr-bg);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+.modal h2 { margin: 0 0 4px; }
+.modal p { margin: 0 0 12px; }
+.choices { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: 0 0 12px; padding: 0; border: none; }
+.choice {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--mr-border);
+    border-radius: var(--mr-radius);
+    cursor: pointer;
+}
+.choice:hover { border-color: var(--mr-accent); }
+.choice:has(input:checked) { border-color: var(--mr-accent); background: var(--mr-accent-muted); }
+.choice:has(input:focus-visible) { outline: 2px solid var(--mr-accent); outline-offset: 1px; }
+.choice input { margin: 3px 0 0; }
+.choice-title { display: block; font-weight: 600; }
+.choice-hint { display: block; color: var(--mr-muted); font-size: 0.9em; }
+.modal-error { margin-bottom: 10px; color: var(--mr-red); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

@@ -19,9 +19,33 @@ const state = {
     collapsedDirs: null, // folder paths folded in the tree (persisted per review)
     fileFold: new Map(), // path -> folded, for files stacked in a folder view
     content: new Map(), // `${revisionId}:${path}` -> full-file load state for the file view
+    settings: null, // per-repository settings from the server; null hides the learning controls
+    dialog: null, // open Configure dialog: { learning, saving, error }
+    switching: false, // a scope switch is in flight
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
+
+const LEARNING_MODES = ["off", "suggest", "auto"];
+const LEARNING = {
+    off: { label: "Off", pill: "Off", hint: "Copilot only addresses each comment. It does not edit instruction files or record guidelines unless you ask." },
+    suggest: { label: "Suggest", pill: "Suggest", hint: "Copilot proposes a guideline in the thread when your feedback reveals a reusable rule, and saves it only after you approve." },
+    auto: { label: "Save automatically", pill: "Auto-save", hint: "Copilot saves settled guidelines to the repository's instruction files and tells you where. Personal rules still wait for your confirmation." },
+};
+const LESSON_STATUSES = {
+    proposed: "Proposed by Copilot and not saved yet. Approve it in the thread to save it.",
+    saved: "Saved as a guideline for future work.",
+    declined: "Declined; not saved.",
+};
+const scopeOf = (review) => (review?.scope === "pending" ? "pending" : "all");
+const scopeLabel = (scope) => (scope === "pending" ? "pending changes" : "all changes");
+const learningMode = () => (LEARNING_MODES.includes(state.settings?.learning) ? state.settings.learning : "off");
+// Lessons recorded before statuses existed were saved by definition.
+const lessonStatus = (lesson) => (Object.hasOwn(LESSON_STATUSES, lesson.status) ? lesson.status : "saved");
+const lessonBadge = (lesson) => {
+    const status = lessonStatus(lesson);
+    return `<span class="badge lesson-${status}" title="${esc(LESSON_STATUSES[status])}">${status}</span>`;
+};
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -195,6 +219,21 @@ async function api(method, path, body) {
     return json;
 }
 
+// A scope switch points this page at a different review; nothing derived from the previous one may carry over.
+function resetForReview() {
+    state.snapshot = null;
+    state.view = { type: "overview" };
+    state.selection = null;
+    state.pendingJump = null;
+    state.open.clear();
+    state.pending.clear();
+    state.expanded.clear();
+    state.fileFold.clear();
+    state.content.clear();
+    state.collapsedDirs = null;
+    viewRestored = false;
+}
+
 let loading = null;
 let reloadAgain = false;
 async function loadState() {
@@ -206,7 +245,9 @@ async function loadState() {
         do {
             reloadAgain = false;
             const data = await api("GET", "state");
+            if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
+            state.settings = data.settings ?? null;
             if (data.session) state.busy = data.session.busy;
             const rev = state.review.currentRevisionId;
             if (rev && state.snapshot?.revisionId !== rev) state.snapshot = await api("GET", `snapshot/${rev}`);
@@ -451,6 +492,7 @@ function render() {
     const main = $("#main");
     const scroll = main.scrollTop;
     renderTop();
+    renderBanner();
     renderSide();
     renderMain();
     main.scrollTop = scroll;
@@ -464,27 +506,163 @@ function render() {
     }
 }
 
+function scopeToggleHtml(scope) {
+    const button = (value, label, title) => `<button type="button" data-action="scope" data-scope="${value}" aria-pressed="${scope === value}" title="${esc(title)}"${state.switching ? " disabled" : ""}>${label}</button>`;
+    return `<span class="seg" role="group" aria-label="Review scope">`
+        + button("all", "All changes", "Everything on this branch since it diverged from the base, plus uncommitted work")
+        + button("pending", "Pending changes", "Only uncommitted work: staged, unstaged and untracked files compared with HEAD")
+        + `</span>`;
+}
+
 function renderTop() {
     const r = state.review;
     if (!r) return;
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
+    const scope = scopeOf(r);
     const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => ["queued", "processing"].includes(m.delivery?.state)).length;
+    const branch = `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span>`;
     const parts = [
         `<span class="title">${esc(r.title)}</span>`,
-        `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span><span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`,
+        scope === "pending"
+            ? `${branch}<span class="muted">uncommitted changes only</span>`
+            : `${branch}<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`,
+        scopeToggleHtml(scope),
     ];
     if (rev) parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
-    if (git.upstream) {
-        const { ahead, behind, name } = git.upstream;
-        parts.push(`<span class="pill${ahead || behind ? " warn" : ""}" title="${esc(name)}">↑${ahead} ↓${behind}</span>`);
-    } else if (git.branch) parts.push(`<span class="pill warn">no upstream</span>`);
-    if (git.uncommittedFiles) parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
+    if (scope === "all") {
+        if (git.upstream) {
+            const { ahead, behind, name } = git.upstream;
+            parts.push(`<span class="pill${ahead || behind ? " warn" : ""}" title="${esc(name)}">↑${ahead} ↓${behind}</span>`);
+        } else if (git.branch) parts.push(`<span class="pill warn">no upstream</span>`);
+        if (git.uncommittedFiles) parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
+    }
     if (state.connection === "lost") parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
     else if (state.busy === true) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
-    parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
+    parts.push(`<span class="spacer"></span>`);
+    if (state.settings) {
+        const mode = LEARNING[learningMode()];
+        parts.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Choose how Copilot learns from your review feedback in this repository">Configure</button>`);
+    }
+    parts.push(`<button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
     $("#top").innerHTML = parts.join("");
+}
+
+// ---------- Learning setting: first-use banner and Configure dialog ----------
+
+function bannerHtml() {
+    const s = state.settings;
+    if (!s || s.configured || s.dismissed) return "";
+    const choice = (mode, primary) => `<button data-action="learning-set" data-mode="${mode}"${primary ? ` class="primary"` : ""} title="${esc(LEARNING[mode].hint)}">${esc(LEARNING[mode].label)}</button>`;
+    return `<span class="banner-text"><strong>Learn from your review feedback in ${esc(s.repoName)}?</strong> Copilot can turn your comments into reusable coding guidelines. The choice is stored on this machine only, and Configure changes it any time.</span>`
+        + `<span class="banner-actions">${choice("suggest", true)}${choice("auto", false)}`
+        + `<button class="link" data-action="learning-dismiss" title="Hide this notice. Learning stays off until you choose a mode with Configure.">Not now</button></span>`;
+}
+
+function renderBanner() {
+    const el = $("#banner");
+    const html = bannerHtml();
+    el.hidden = !html;
+    el.innerHTML = html;
+}
+
+function dialogHtml() {
+    const d = state.dialog;
+    if (!d) return "";
+    const choices = LEARNING_MODES.map((mode) => `<label class="choice"><input type="radio" name="learning" value="${mode}"${d.learning === mode ? " checked" : ""}>`
+        + `<span><span class="choice-title">${esc(LEARNING[mode].label)}</span><span class="choice-hint">${esc(LEARNING[mode].hint)}</span></span></label>`).join("");
+    return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
+        + `<h2 id="dialog-title">Learn from review feedback</h2>`
+        + `<p id="dialog-desc" class="muted">Setting for ${esc(state.settings?.repoName ?? "this repository")}. It is stored on this machine only and never committed.</p>`
+        + `<fieldset class="choices"><legend class="sr-only">Learning mode</legend>${choices}</fieldset>`
+        + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
+        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
+        + `<button class="primary" data-action="dialog-save"${d.saving ? " disabled" : ""}>${d.saving ? "Saving…" : "Save"}</button></div>`
+        + `</div></div>`;
+}
+
+function focusIn(selector) {
+    $(selector)?.focus?.();
+}
+
+// The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
+function renderDialog() {
+    $("#dialog").innerHTML = dialogHtml();
+    for (const id of ["#top", "#banner", "#layout"]) {
+        const el = $(id);
+        if (el) el.inert = Boolean(state.dialog);
+    }
+}
+
+function openConfigure() {
+    if (!state.settings || state.dialog) return;
+    state.dialog = { learning: learningMode(), saving: false, error: "" };
+    renderDialog();
+    focusIn('#dialog input[name="learning"]:checked');
+}
+
+function closeConfigure() {
+    if (!state.dialog || state.dialog.saving) return;
+    state.dialog = null;
+    renderDialog();
+    focusIn('[data-action="configure"]');
+}
+
+async function updateSettings(patch) {
+    state.settings = await api("POST", "settings", patch);
+    renderTop();
+    renderBanner();
+}
+
+async function saveConfigure() {
+    const d = state.dialog;
+    if (!d || d.saving) return;
+    d.saving = true;
+    d.error = "";
+    renderDialog();
+    try {
+        await updateSettings({ learning: d.learning });
+        state.dialog = null;
+        renderDialog();
+        focusIn('[data-action="configure"]');
+        toast(`Learning mode: ${LEARNING[learningMode()].label}`);
+    } catch (err) {
+        d.saving = false;
+        d.error = err.message;
+        renderDialog();
+        focusIn('#dialog [data-action="dialog-save"]');
+    }
+}
+
+// Keeps Tab inside the open dialog; a radio group is a single tab stop (its checked radio).
+function trapTab(e) {
+    const radios = [...document.querySelectorAll('#dialog input[name="learning"]')];
+    const radio = radios.find((x) => x.checked) ?? radios[0];
+    const stops = [radio, ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean);
+    if (!stops.length) return;
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+    }
+}
+
+async function switchScope(scope) {
+    if (state.switching || scope === scopeOf(state.review)) return;
+    state.switching = true;
+    renderTop();
+    try {
+        await api("POST", "scope", { scope });
+        await loadState();
+    } finally {
+        state.switching = false;
+        renderTop();
+    }
 }
 
 function activeCount(pathName) {
@@ -501,7 +679,7 @@ function treeHtml(node, depth, out) {
     const collapsed = collapsedDirs().has(node.path);
     const files = filesUnder(node.path);
     const n = files.reduce((sum, f) => sum + activeCount(f.path), 0);
-    const title = node.path === "" ? `${state.review.repoRoot} — all changes` : node.path;
+    const title = node.path === "" ? `${state.review.repoRoot} — ${scopeLabel(scopeOf(state.review))}` : node.path;
     out.push(`<div class="nav-item tree dir${v.type === "folder" && v.path === node.path ? " active" : ""}" data-action="nav" data-view="folder" data-path="${esc(node.path)}" style="--depth:${depth}" title="${esc(title)}" role="treeitem" aria-expanded="${!collapsed}">`
         + `<span class="twisty${collapsed ? "" : " open"}" data-action="fold" data-path="${esc(node.path)}" title="${collapsed ? "Expand" : "Collapse"}">${CHEVRON}</span>`
         + FOLDER_ICON
@@ -554,11 +732,17 @@ function renderSide() {
         `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
         `<div class="section">Files (${files.length})</div>`,
-        `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
-        `<div role="tree">`,
     ];
-    if (files.length) treeHtml(buildTree(files), 0, html);
-    html.push(`</div>`);
+    if (files.length) {
+        html.push(
+            `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
+            `<div role="tree">`,
+        );
+        treeHtml(buildTree(files), 0, html);
+        html.push(`</div>`);
+    } else if (state.snapshot) {
+        html.push(`<div class="side-empty">${scopeOf(r) === "pending" ? "No uncommitted changes." : "No changes against the base."}</div>`);
+    }
     $("#side").innerHTML = html.join("");
 }
 
@@ -638,7 +822,7 @@ function messageHtml(m) {
         + deliveryHtml(m)
         + `</div>${md(m.body)}`
         + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
-        + (lessons.length ? `<div class="lessons">Learned:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}</li>`).join("")}</ul></div>` : "")
+        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}</li>`).join("")}</ul></div>` : "")
         + `</div>`;
 }
 
@@ -670,6 +854,17 @@ function threadHtml(t, { showLocation = false } = {}) {
     return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map(messageHtml).join("")}${reply}</div></div>`;
 }
 
+// Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
+function emptyDiffHtml() {
+    const files = state.snapshot?.files;
+    if (!files || files.length) return "";
+    if (scopeOf(state.review) === "pending") {
+        return `<div class="card empty-diff"><strong>No uncommitted changes.</strong> The working tree matches HEAD, so there is nothing to review in this scope.`
+            + ` <button data-action="scope" data-scope="all">Switch to All changes</button></div>`;
+    }
+    return `<div class="card empty-diff"><strong>No changes to review.</strong> Nothing differs from ${esc(state.review.base)}.</div>`;
+}
+
 function overviewView() {
     const r = state.review;
     const overall = r.threads.filter((t) => t.kind === "overview" && t.status === "active");
@@ -687,7 +882,8 @@ function overviewView() {
             + `</div>`;
     };
     const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
-    return descriptionHtml()
+    return emptyDiffHtml()
+        + descriptionHtml()
         + `<h2>Overall discussion</h2>`
         + (overall.length ? overall.map((t) => threadHtml(t)).join("") : `<div class="empty">No overall comments yet.</div>`)
         + `<div class="thread">${composerHtml("overview:new", { kind: "overview", label: "Discuss the change or request description edits", placeholder: "Ask to revise the description, discuss the design, or request a change…", alwaysOpen: true })}</div>`
@@ -697,11 +893,23 @@ function overviewView() {
         + `<h2>Revisions</h2><div class="card">${revs || `<div class="empty">No revisions.</div>`}</div>`;
 }
 
+function lessonsEmptyHint() {
+    if (!state.settings) return "Copilot records reusable rules here when your comments reveal a preference.";
+    switch (learningMode()) {
+        case "suggest":
+            return "Copilot proposes reusable guidelines here when your comments reveal a preference, and saves one after you approve it.";
+        case "auto":
+            return "Copilot saves reusable guidelines here when your comments reveal a preference.";
+        default:
+            return "Learning is off for this repository, so Copilot does not record guidelines from your comments. Use Configure to turn it on.";
+    }
+}
+
 function lessonsView() {
     const lessons = state.review.lessons;
-    if (!lessons.length) return `<h2>Lessons learned</h2><div class="empty">Copilot records reusable rules here when your comments reveal a preference.</div>`;
-    const rows = [...lessons].reverse().map((l) => `<tr><td><span class="badge">${esc(l.scope)}</span></td><td>${inline(l.rule)}</td><td class="mono muted">${esc(l.savedTo ?? "")}</td><td><button class="link" data-action="jump" data-thread="${esc(l.threadId)}">thread</button><div class="muted">${esc(ago(l.createdAt))}</div></td></tr>`).join("");
-    return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    if (!lessons.length) return `<h2>Lessons learned</h2><div class="empty">${lessonsEmptyHint()}</div>`;
+    const rows = [...lessons].reverse().map((l) => `<tr><td><span class="badge">${esc(l.scope)}</span></td><td>${lessonBadge(l)}</td><td>${inline(l.rule)}</td><td class="mono muted">${esc(l.savedTo ?? "")}</td><td><button class="link" data-action="jump" data-thread="${esc(l.threadId)}">thread</button><div class="muted">${esc(ago(l.createdAt))}</div></td></tr>`).join("");
+    return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Status</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function fileView(file, { stacked = false, folded = false } = {}) {
@@ -1015,6 +1223,28 @@ async function onClick(e) {
             case "jump":
                 jumpToThread(target.dataset.thread);
                 break;
+            case "scope":
+                await switchScope(target.dataset.scope);
+                break;
+            case "configure":
+                openConfigure();
+                break;
+            case "dialog-cancel":
+                closeConfigure();
+                break;
+            case "dialog-backdrop":
+                if (e.target === target) closeConfigure();
+                break;
+            case "dialog-save":
+                await saveConfigure();
+                break;
+            case "learning-set":
+                await updateSettings({ learning: target.dataset.mode });
+                toast(`Learning mode: ${LEARNING[learningMode()].label}`);
+                break;
+            case "learning-dismiss":
+                await updateSettings({ dismissed: true });
+                break;
             default:
                 break;
         }
@@ -1026,6 +1256,10 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
+    if (el.name === "learning" && state.dialog) {
+        state.dialog.learning = el.value;
+        return;
+    }
     if (el.dataset?.action !== "status") return;
     try {
         await api("POST", `threads/${encodeURIComponent(el.dataset.thread)}/status`, { status: el.value });
@@ -1046,6 +1280,13 @@ function onInput(e) {
 }
 
 function onKeyDown(e) {
+    if (state.dialog) {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            closeConfigure();
+        } else if (e.key === "Tab") trapTab(e);
+        return;
+    }
     const el = e.target;
     const key = el.dataset?.composer;
     if (!key) return;

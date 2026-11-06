@@ -1,12 +1,13 @@
 // Extension: manual-review
 // PR-style inline review of local git changes. Comments are delivered to the agent as
-// conversation messages; the agent answers in-thread with the `reply` action and records
-// lessons learned from the feedback.
+// conversation messages; the agent answers in-thread with the `reply` action and, depending on the
+// repository's learning mode, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
 import { Store } from "./lib/store.mjs";
-import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES } from "./lib/review-service.mjs";
+import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
+import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
 import { startReviewServer } from "./lib/server.mjs";
 
@@ -26,6 +27,7 @@ const log = (message, level = "info") => {
 
 const store = new Store();
 const service = new ReviewService({ store, log });
+const settings = new SettingsService({ store, log });
 // instanceId -> { reviewId, server, ready }
 const instances = new Map();
 const openReviewIds = () => new Set([...instances.values()].map((e) => e.reviewId));
@@ -34,6 +36,7 @@ const delivery = new Delivery({
     log,
     send: (options) => session.send(options),
     reviewIds: openReviewIds,
+    learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
 });
 
 function toCanvasError(err) {
@@ -69,8 +72,13 @@ async function ensureServer(instanceId, reviewId) {
         entry.ready = startReviewServer({
             instanceId,
             getReviewId: () => entry.reviewId,
+            onReviewChange: async (nextId) => {
+                entry.reviewId = nextId;
+                await store.setInstanceReview(instanceId, nextId);
+            },
             service,
             delivery,
+            settings,
             webRoot: WEB_ROOT,
             log,
         }).then(
@@ -84,8 +92,11 @@ async function ensureServer(instanceId, reviewId) {
             },
         );
     }
+    const switched = entry.reviewId !== reviewId;
     entry.reviewId = reviewId;
     await entry.ready;
+    // A page that is already open keeps showing the previous review until told to reload.
+    if (switched) service.changed(reviewId, "open");
     return entry;
 }
 
@@ -100,7 +111,7 @@ async function openReview(ctx) {
         const previous = instances.get(ctx.instanceId)?.reviewId ?? (await store.getInstanceReview(ctx.instanceId));
         if (previous) {
             try {
-                reviewId = await service.ensureReview({ reviewId: previous, title: input.title }, { cwd });
+                reviewId = await service.ensureReview({ reviewId: previous, title: input.title, scope: input.scope }, { cwd });
             } catch (err) {
                 if (err?.code !== "not_found") throw err;
             }
@@ -158,7 +169,7 @@ const actions = [
     },
     {
         name: "get_review",
-        description: "Read the review: git state, threads with messages and delivery state, and lessons. Use to catch up on comments or check what is still unanswered.",
+        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered.",
         inputSchema: {
             type: "object",
             properties: {
@@ -171,7 +182,8 @@ const actions = [
         handler: guarded(async (ctx) => {
             const input = inputOf(ctx);
             const review = await service.getReview(await reviewIdFor(ctx, input));
-            return service.summarize(review, { threadId: input.threadId, includeResolved: input.includeResolved === true });
+            const summary = service.summarize(review, { threadId: input.threadId, includeResolved: input.includeResolved === true });
+            return { ...summary, learning: (await settings.get(review.repoRoot)).learning };
         }),
     },
     {
@@ -188,15 +200,16 @@ const actions = [
                 verification: { type: "string", description: "How the change was verified (build/test command and result)." },
                 lessons: {
                     type: "array",
-                    description: "Reusable rules learned from this comment and where they were saved.",
+                    description: "Reusable guidelines drawn from this comment, and what happened to them. Follow the learning mode in the delivered prompt.",
                     items: {
                         type: "object",
                         properties: {
+                            lessonId: { type: "string", description: "A guideline already listed for this thread; use it to record the reviewer's decision on it." },
                             scope: { type: "string", enum: ["repo", "personal"] },
-                            rule: { type: "string" },
+                            rule: { type: "string", description: "The guideline text. Required unless lessonId is given." },
+                            status: { type: "string", enum: LESSON_STATUSES, description: "proposed: suggested to the reviewer; saved (default): written to savedTo; declined: the reviewer rejected it." },
                             savedTo: { type: "string", description: "Instruction file the rule was written to." },
                         },
-                        required: ["rule"],
                         additionalProperties: false,
                     },
                 },
@@ -289,13 +302,14 @@ session = await joinSession({
         createCanvas({
             id: CANVAS_ID,
             displayName: "Manual review",
-            description: "PR-style inline review of local git changes with threaded discussion delivered to the agent.",
+            description: "PR-style inline review of local git changes (the whole branch or only pending changes) with threaded discussion delivered to the agent.",
             inputSchema: {
                 type: "object",
                 properties: {
                     reviewId: { type: "string", description: "Reopen an existing review." },
                     repoPath: { type: "string", description: "Repository path (defaults to the session working directory)." },
-                    base: { type: "string", description: "Base ref; the diff is working tree vs merge-base(base, HEAD). Defaults to origin/HEAD, main, or master." },
+                    base: { type: "string", description: "Base ref; with scope all, the diff is working tree vs merge-base(base, HEAD). Defaults to origin/HEAD, main, or master." },
+                    scope: { type: "string", enum: SCOPES, description: "all (default): the whole branch or PR, working tree vs merge-base(base, HEAD). pending: only uncommitted changes, working tree vs HEAD. On an open review, the other scope opens its sibling review." },
                     title: { type: "string" },
                     paths: { type: "array", items: { type: "string" }, description: "Limit the review to these pathspecs." },
                     exclude: { type: "array", items: { type: "string" }, description: "Pathspecs to exclude, e.g. agency.toml." },

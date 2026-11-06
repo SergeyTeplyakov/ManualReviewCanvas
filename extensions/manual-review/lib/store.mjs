@@ -76,6 +76,10 @@ export class Store {
         return path.join(this.reviewDir(reviewId), "snapshots", `${assertRevisionId(revisionId)}.json`);
     }
 
+    settingsFile() {
+        return path.join(this.root, "settings.json");
+    }
+
     // Serializes async work per key; the callback always sees the latest committed state.
     async lock(key, fn) {
         const prev = this.locks.get(key) ?? Promise.resolve();
@@ -123,20 +127,39 @@ export class Store {
         await this.lock("lessons", () => withRetry(() => appendFile(path.join(this.root, "lessons.jsonl"), JSON.stringify(lesson) + "\n", "utf8")));
     }
 
+    // lessons.jsonl is append-only; a lesson updated in place (proposed -> saved) is appended again and the last record wins.
     async readLessons() {
         try {
             const text = await readFile(path.join(this.root, "lessons.jsonl"), "utf8");
-            return text.split("\n").filter(Boolean).flatMap((l) => {
+            const byId = new Map();
+            for (const line of text.split("\n").filter(Boolean)) {
                 try {
-                    return [JSON.parse(l)];
+                    const lesson = JSON.parse(line);
+                    byId.set(lesson.lessonId ?? line, lesson);
                 } catch {
-                    return [];
+                    // A torn or hand-edited line is skipped rather than failing the whole read.
                 }
-            });
+            }
+            return [...byId.values()];
         } catch (err) {
             if (err?.code === "ENOENT") return [];
             throw err;
         }
+    }
+
+    async readSettings() {
+        return (await readJson(this.settingsFile())) ?? { version: 1, repos: {} };
+    }
+
+    // Read-modify-write of the per-user settings file. mutate(settings) edits it in place and may return a value.
+    async updateSettings(mutate) {
+        return this.lock("settings", async () => {
+            const settings = await this.readSettings();
+            if (!settings.repos || typeof settings.repos !== "object") settings.repos = {};
+            const value = await mutate(settings);
+            await writeJsonAtomic(this.settingsFile(), settings);
+            return value;
+        });
     }
 
     async getInstanceReview(instanceId) {

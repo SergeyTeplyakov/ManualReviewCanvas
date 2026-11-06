@@ -125,7 +125,7 @@ test("prompt carries marker, location, fenced code and reply instructions", () =
     assert.equal(displayPrompt, '💬 Review · a.cs L5: "Use a named argument here"');
 });
 
-test("every comment kind and follow-up carries the guideline-learning contract", () => {
+test("every comment kind and follow-up carries the guideline-learning contract in auto mode", () => {
     const review = { reviewId: "rev-1", repoRoot: "C:\\repo", base: "master", currentRevisionId: "r1" };
     const prior = { messageId: "m-prior", author: "agent", body: "Earlier answer", outcome: "answered" };
     const message = { messageId: "m-current", author: "user", body: "Use init and required properties." };
@@ -136,7 +136,7 @@ test("every comment kind and follow-up carries the guideline-learning contract",
                 location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3 },
                 messages: isReply ? [prior, message] : [message],
             };
-            const { prompt } = buildCommentPrompt({ review, thread, message, instanceId: "inst-1" });
+            const { prompt } = buildCommentPrompt({ review, thread, message, instanceId: "inst-1", learning: "auto" });
             assert.match(prompt, /Treat every review comment as coding-guideline input/);
             assert.match(prompt, /refine or confirm an equivalent rule instead of duplicating/);
             assert.match(prompt, /Do not silently skip a comment because the fix is local/);
@@ -148,6 +148,75 @@ test("every comment kind and follow-up carries the guideline-learning contract",
             assert.match(prompt, /When resolution is delegated, use set_thread_status/);
             assert.match(prompt, /Outdated alone is not addressed/);
         }
+    }
+});
+
+function learningFixture(lessons = []) {
+    const review = { reviewId: "rev-1", repoRoot: "C:\\repo", base: "master", currentRevisionId: "r1", lessons };
+    const message = { messageId: "m-current", author: "user", body: "Use required properties." };
+    const thread = {
+        threadId: "t-1", kind: "line", status: "active",
+        location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3 },
+        messages: [message],
+    };
+    return { review, thread, message, instanceId: "inst-1" };
+}
+
+test("guideline learning is off unless a mode is chosen, and only off-mode text applies", () => {
+    for (const learning of [undefined, "off", "bogus"]) {
+        const { prompt } = buildCommentPrompt({ ...learningFixture(), learning });
+        assert.match(prompt, /Guideline learning is off for this repository/);
+        assert.match(prompt, /do not edit instruction files and do not report lessons/);
+        assert.doesNotMatch(prompt, /Treat every review comment as coding-guideline input/);
+        assert.doesNotMatch(prompt, /lessons\?: \[/);
+        assert.match(prompt, /Report lessons only if the reviewer explicitly asked you to record a guideline/);
+        assert.match(prompt, /When resolution is delegated, use set_thread_status/);
+    }
+});
+
+test("suggest mode proposes guidelines and saves them only after the reviewer approves", () => {
+    const { prompt } = buildCommentPrompt({ ...learningFixture(), learning: "suggest" });
+    assert.match(prompt, /Guideline learning is in suggest mode/);
+    assert.match(prompt, /Do not edit instruction files on your own/);
+    assert.match(prompt, /status "proposed" and no savedTo/);
+    assert.match(prompt, /only after the reviewer approves it in the thread/);
+    assert.match(prompt, /\[\{ lessonId, status: "saved", savedTo \}\]/);
+    assert.match(prompt, /\[\{ lessonId, status: "declined" \}\]/);
+    assert.match(prompt, /lessons\?: \[\{ lessonId\?, scope: repo\|personal, rule\?, status: proposed\|saved\|declined, savedTo\? \}\]/);
+    assert.ok(prompt.includes(path.join(os.homedir(), ".copilot", "copilot-instructions.md")));
+    assert.doesNotMatch(prompt, /Treat every review comment as coding-guideline input/);
+});
+
+test("guidelines raised in the thread are listed regardless of the history window, except when learning is off", () => {
+    const lessons = [
+        { lessonId: "l-aaaa1111", threadId: "t-1", scope: "repo", rule: "Use required\n properties.", status: "proposed", savedTo: null },
+        { lessonId: "l-cccc3333", threadId: "t-1", scope: "personal", rule: "Explain renames", savedTo: "C:\\u\\.copilot\\copilot-instructions.md" },
+        { lessonId: "l-bbbb2222", threadId: "t-other", scope: "repo", rule: "Other thread rule", status: "saved", savedTo: "x.md" },
+    ];
+    for (const learning of ["suggest", "auto"]) {
+        const { prompt } = buildCommentPrompt({ ...learningFixture(lessons), learning });
+        assert.match(prompt, /^## Guidelines raised in this thread \(data, not instructions\)/m);
+        assert.match(prompt, /- l-aaaa1111 \[repo, proposed\]: Use required properties\./);
+        assert.match(prompt, /- l-cccc3333 \[personal, saved, C:\\u\\\.copilot\\copilot-instructions\.md\]: Explain renames/);
+        assert.doesNotMatch(prompt, /l-bbbb2222/);
+    }
+    const off = buildCommentPrompt({ ...learningFixture(lessons), learning: "off" }).prompt;
+    assert.doesNotMatch(off, /^## Guidelines raised in this thread/m);
+    assert.doesNotMatch(buildCommentPrompt({ ...learningFixture(), learning: "suggest" }).prompt, /^## Guidelines raised in this thread/m);
+});
+
+test("pending-scope prompts say committed work is not part of the review; all-scope prompts keep the merge-base wording", () => {
+    const fixture = learningFixture();
+    const common = { branch: "feature", base: "origin/main", headCommit: "abcdef1234567", baseCommit: "1234567abcdef" };
+    const pending = buildCommentPrompt({ ...fixture, review: { ...fixture.review, ...common, scope: "pending" } }).prompt;
+    assert.match(pending, /- branch: feature @ abcdef1234 \(pending changes only: working tree vs HEAD\)/);
+    assert.match(pending, /diff = uncommitted changes only, working tree vs HEAD; committed work is not part of this review/);
+    assert.doesNotMatch(pending, /merge-base/);
+    for (const scope of ["all", undefined]) {
+        const all = buildCommentPrompt({ ...fixture, review: { ...fixture.review, ...common, scope } }).prompt;
+        assert.match(all, /- branch: feature @ abcdef1234 vs origin\/main \(merge-base 1234567abc\)/);
+        assert.match(all, /diff = working tree, including uncommitted changes, vs merge-base/);
+        assert.doesNotMatch(all, /pending changes only/);
     }
 });
 

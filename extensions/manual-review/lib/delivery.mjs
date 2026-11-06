@@ -14,13 +14,15 @@ export class Delivery extends EventEmitter {
      * @param {(options: object) => Promise<string>} p.send session.send
      * @param {(msg: string, level?: string) => void} p.log
      * @param {() => Iterable<string>} p.reviewIds reviews to settle when the agent goes idle
+     * @param {(repoRoot: string) => Promise<string>} [p.learning] guideline-learning mode for a repository; failures fall back to off
      */
-    constructor({ service, send, log = () => {}, reviewIds = () => [] }) {
+    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off" }) {
         super();
         this.service = service;
         this.send = send;
         this.log = log;
         this.reviewIds = reviewIds;
+        this.learning = learning;
         this.busy = null;
         this.bySessionMessageId = new Map();
         this.seenSessionMessageIds = new Set();
@@ -37,7 +39,14 @@ export class Delivery extends EventEmitter {
             await this.service.setDelivery(reviewId, messageId, { state: "saving", error: null }, { force: true });
         }
 
-        const { prompt, displayPrompt } = buildCommentPrompt({ ...ctx, message, instanceId });
+        let learning = "off";
+        try {
+            learning = await this.learning(ctx.review.repoRoot);
+        } catch (err) {
+            this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+        }
+
+        const { prompt, displayPrompt } = buildCommentPrompt({ ...ctx, message, instanceId, learning });
         let sessionMessageId;
         try {
             sessionMessageId = await this.send({ prompt, displayPrompt, mode: "enqueue" });

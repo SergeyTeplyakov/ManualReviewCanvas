@@ -1,6 +1,6 @@
 ---
 name: manual-review
-description: "Human-led code review of local Git changes in an interactive PR-style diff canvas with persistent inline threads, agent fixes, threaded replies, and review-derived coding guidelines. USE FOR: manual review, review canvas, walk through changes, comment on diff, inline diff comments, local PR-style review."
+description: "Human-led code review of local Git changes in an interactive PR-style diff canvas with persistent inline threads, agent fixes, threaded replies, and optional review-derived coding guidelines. USE FOR: manual review, review canvas, walk through changes, review pending changes, comment on diff, inline diff comments, local PR-style review."
 ---
 
 # Manual review
@@ -34,7 +34,13 @@ thread. This is not an autonomous code-review pipeline.
 
 1. Establish the intended comparison from the user's request and existing
    context. Ask only if the base or scope is ambiguous. Distinguish the published
-   PR, committed branch changes, and local working-tree changes.
+   PR, committed branch changes, and local working-tree changes. Open the canvas
+   with the matching `scope`; each scope is a separate review with its own
+   threads, and the reviewer can switch between them in the canvas:
+   - `all` (default): the whole branch or PR, which is the working tree against
+     the merge base of the base ref and HEAD.
+   - `pending`: only uncommitted work (staged, unstaged, and untracked files),
+     which is the working tree against HEAD.
 2. Read repository instructions and inspect Git state without modifying it.
    Preserve unrelated edits and include only the selected scope.
 3. Capture a review revision with the repository identity, base commit, target
@@ -95,14 +101,16 @@ an external service without explicit authorization.
 3. Distinguish questions from change requests. Explain when asked to discuss;
    make the smallest complete change when asked to fix. Clarify contradictory
    comments or behavior choices before editing.
-4. Capture the coding guideline using [Learn from every comment](#learn-from-every-comment).
-   Apply confirmed guidance to this change and subsequent relevant work.
+4. Handle any coding guideline according to the repository's learning mode, as in
+   [Learn from review feedback](#learn-from-review-feedback). Apply confirmed
+   guidance to this change and subsequent relevant work.
 5. Read nearby implementation and tests, follow applicable instructions, and
    preserve user-owned edits. Run the narrowest verification relevant to a fix.
 6. Reply through the extension's discovered thread action with what changed,
-   the verification outcome, or the reason work is blocked or disputed. Include
-   the guideline added, refined, or already covered and its instruction-file path. If
-   thread reply delivery fails, say so in chat; do not imply the reply was saved.
+   the verification outcome, or the reason work is blocked or disputed. When
+   learning is on, include the guideline proposed, added, refined, or already
+   covered and its instruction-file path. If thread reply delivery fails, say so
+   in chat; do not imply the reply was saved.
 7. Refresh the review to a new revision after edits. Retain the comment history
    and original anchors; do not silently attach an old comment to different code.
 8. Honor the user's resolution preference. When they delegate resolution (including
@@ -111,11 +119,27 @@ an external service without explicit authorization.
    clarification-needed work active. Preserve history and reopening; never
    resolve merely because an anchor is outdated.
 
-## Learn from every comment
+## Learn from review feedback
 
-- Treat every review comment as coding-guideline input, not just a local fix.
-  Extract the underlying intent into a concise, actionable rule with appropriate
-  scope. Do not silently skip a comment because the fix is local.
+Whether comments become standing guidelines is a per-repository setting, the
+learning mode. The reviewer picks it with the Configure button in the canvas and
+it is kept in their own settings, never in the repository. Each delivered comment
+states the active mode, and the discovered read action reports it. Follow the
+stated mode and treat a missing one as off.
+
+- off (default): address the comment itself. Do not edit instruction files or
+  report lessons unless the reviewer explicitly asks you to record a guideline.
+- suggest: propose a reusable rule in the thread reply and report it as a lesson
+  with status `proposed`. Write nothing to instruction files until the reviewer
+  approves it in the thread; then save it and report it as `saved`, or as
+  `declined` if they reject it.
+- auto: treat every review comment as coding-guideline input and save the
+  confirmed rule. Do not silently skip a comment because the fix is local.
+
+When proposing or saving a rule:
+
+- Extract the underlying intent into a concise, actionable rule with appropriate
+  scope, not just a local fix.
 - Read existing instructions first. Refine or confirm an equivalent rule rather
   than appending duplicates. Keep one canonical home for each rule.
 - Save repository-specific guidance in the applicable path-scoped file under
@@ -137,6 +161,8 @@ an external service without explicit authorization.
 
 - Do not commit, push, publish PR comments, or update a PR solely because a local
   review comment was posted. These require the user's explicit authorization.
+- Do not edit instruction files to record a guideline unless the learning mode,
+  or the reviewer's explicit request, allows it.
 - Do not infer completion of a long-running fix from message queue acceptance.
 - Do not run multiple overlapping fixes against the same checkout concurrently.
 - Do not discard unresolved comments or hide failed delivery during refresh.
@@ -149,7 +175,8 @@ Exercise the rendered UI with a clearly labeled test comment and confirm that it
 arrives exactly once in the owning conversation with the correct file, side,
 range, revision, and hunk. Confirm that an agent reply appears in that same thread.
 Check persistence across a panel and extension reload, stale-anchor handling,
-and visible messaging failures. Test without editing production code, then remove
+visible messaging failures, scope switching, and that the learning mode chosen in
+Configure reaches the next delivered comment. Test without editing production code, then remove
 only the test data created for this check.
 
 Report partial results honestly: a written skill, a registered canvas, rendered

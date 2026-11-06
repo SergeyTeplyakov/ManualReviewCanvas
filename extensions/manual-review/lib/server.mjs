@@ -6,6 +6,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { SCOPES } from "./review-service.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const STATIC = {
@@ -80,8 +81,10 @@ const STATUS_FOR_CODE = { invalid_input: 400, not_found: 404, conflict: 409, git
  * @param {import("./delivery.mjs").Delivery} p.delivery
  * @param {string} p.webRoot
  * @param {(msg: string, level?: string) => void} p.log
+ * @param {import("./settings.mjs").SettingsService} [p.settings] per-repository settings; the UI hides them when absent
+ * @param {(reviewId: string) => Promise<void> | void} [p.onReviewChange] makes getReviewId return the new review; required to switch scope
  */
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {} }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange }) {
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     let port = 0;
@@ -133,6 +136,16 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         });
     };
 
+    async function readSettings(repoRoot) {
+        if (!settings) return null;
+        try {
+            return await settings.get(repoRoot);
+        } catch (err) {
+            log(`manual-review: could not read settings: ${err?.message ?? err}`, "warning");
+            return null;
+        }
+    }
+
     async function api(req, res, url) {
         const provided = req.headers["x-mr-token"] ?? (req.method === "GET" ? url.searchParams.get("t") : null);
         if (!tokenMatches(token, provided)) throw new HttpError(403, "forbidden", "Invalid token.");
@@ -146,7 +159,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy } });
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot) });
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
                 return send(res, 200, await service.getSnapshot(reviewId, parts[1]));
@@ -195,6 +208,21 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         if (parts[0] === "refresh" && parts.length === 1) {
             return send(res, 200, await service.refresh(reviewId));
+        }
+        if (parts[0] === "settings" && parts.length === 1) {
+            if (!settings) throw new HttpError(501, "unsupported", "Settings are not available.");
+            const review = await service.getReview(reviewId);
+            return send(res, 200, await settings.update(review.repoRoot, { learning: body.learning, dismissed: body.dismissed }));
+        }
+        if (parts[0] === "scope" && parts.length === 1) {
+            if (!SCOPES.includes(body.scope)) throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);
+            if (!onReviewChange) throw new HttpError(501, "unsupported", "Switching scope is not available.");
+            const nextId = await service.openSibling(reviewId, body.scope);
+            if (nextId !== reviewId) {
+                await onReviewChange(nextId);
+                service.changed(nextId, "scope");
+            }
+            return send(res, 200, { reviewId: nextId, scope: body.scope });
         }
         throw new HttpError(404, "not_found", "Unknown endpoint.");
     }

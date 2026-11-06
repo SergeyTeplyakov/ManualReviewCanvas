@@ -21,6 +21,7 @@ import { Store } from "../../extensions/manual-review/lib/store.mjs";
 import { ReviewService } from "../../extensions/manual-review/lib/review-service.mjs";
 import { Delivery } from "../../extensions/manual-review/lib/delivery.mjs";
 import { startReviewServer } from "../../extensions/manual-review/lib/server.mjs";
+import { SettingsService } from "../../extensions/manual-review/lib/settings.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "manual-review", "web");
@@ -405,7 +406,7 @@ function lineOf(text, needle) {
 
 async function seed(tmp) {
     const repo = path.join(tmp, "orders-api");
-    const origin = path.join(tmp, "origin.git");
+    const origin = path.join(tmp, "orders-api.git");
     await runGit(tmp, ["init", "-q", "--bare", "-b", "main", origin]);
     await runGit(tmp, ["init", "-q", "-b", "main", repo]);
     await writeFiles(repo, MAIN);
@@ -455,8 +456,8 @@ async function seed(tmp) {
     await service.updateDescription(reviewId, { body: DESCRIPTION(false), expectedVersion: 0 });
     await reply(40, overall.threadId, {
         outcome: "answered",
-        body: "Drafted it above: purpose, behavior, verification and risks. I'll keep it in sync as the diff changes.",
-        lessons: [{ scope: "personal", rule: "Keep PR descriptions short: purpose, behavior change, verification, risks.", savedTo: "~/.copilot/copilot-instructions.md" }],
+        body: "Drafted it above: purpose, behavior, verification and risks. I'll keep it in sync as the diff changes. Short descriptions look like a personal preference, so I proposed it as a guideline: say yes and I'll save it to your own instructions.",
+        lessons: [{ scope: "personal", rule: "Keep PR descriptions short: purpose, behavior change, verification, risks.", status: "proposed" }],
     });
 
     const jitter = await onLine(36, FEATURE, "src/http/retry.ts", "return Math.min(exponential, policy.maxDelayMs);",
@@ -516,7 +517,7 @@ async function seed(tmp) {
     const outdated = (await service.getReview(reviewId)).threads.find((t) => t.threadId === jitter.threadId);
     if (outdated.location?.state !== "outdated") throw new Error("Expected the jitter thread to be outdated after revision 2.");
 
-    return { reviewId, service, delivery, threads: { clamp: clamp.threadId, idempotent: idempotent.threadId } };
+    return { reviewId, service, delivery, store, threads: { clamp: clamp.threadId, idempotent: idempotent.threadId } };
 }
 
 // ---------- Capture ----------
@@ -558,16 +559,25 @@ async function fitHeight(page, maxHeight) {
     await page.waitForTimeout(250);
 }
 
-async function capture(browser, url, theme, threads) {
+async function capture(browser, url, theme, resetLearning) {
+    await resetLearning();
     const context = await browser.newContext({ viewport: { width: WIDTH, height: 900 }, deviceScaleFactor: 2, colorScheme: theme });
     const page = await context.newPage();
     await page.goto(url);
     await page.locator("#side .nav-item").first().waitFor();
-    const shot = async (name) => {
+    const shot = async (name, clip) => {
         const target = path.join(OUT, `${name}-${theme}.png`);
-        await page.screenshot({ path: target });
+        await page.screenshot({ path: target, clip });
         console.log(`  ${path.relative(process.cwd(), target)}`);
     };
+
+    // A repository with no learning setting opens with a notice. Choosing Suggest from it dismisses the notice for good.
+    await page.locator("#banner:not([hidden])").waitFor();
+    const banner = await page.locator("#banner").boundingBox();
+    await shot("banner", { x: 0, y: 0, width: WIDTH, height: Math.ceil(banner.y + banner.height) });
+    await page.locator('#banner [data-action="learning-set"][data-mode="suggest"]').click();
+    await page.locator("#banner").waitFor({ state: "hidden" });
+    await page.locator("#toast").waitFor({ state: "hidden" });
 
     // A file with an answered thread (change, verification, lesson) and one Copilot is working on.
     await nav(page, "file", "src/http/retry.ts");
@@ -598,6 +608,21 @@ async function capture(browser, url, theme, threads) {
     await fitHeight(page, 700);
     await shot("lessons");
 
+    // The per-repository learning setting.
+    await page.locator('#top [data-action="configure"]').click();
+    await page.locator("#dialog .modal").waitFor();
+    await shot("configure");
+    await page.keyboard.press("Escape");
+
+    // The pending scope is its own review of what is not committed yet. Switch back so the next theme starts on the full review.
+    await page.locator('#top [data-action="scope"][data-scope="pending"]').click();
+    await page.locator('#top [data-scope="pending"][aria-pressed="true"]:not([disabled])').waitFor();
+    await nav(page, "file", "src/http/retry.ts");
+    await fitHeight(page, 600);
+    await shot("pending");
+    await page.locator('#top [data-action="scope"][data-scope="all"]').click();
+    await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
+
     await context.close();
 }
 
@@ -605,13 +630,28 @@ const tmp = await mkdtemp(path.join(os.tmpdir(), "mr-shots-"));
 let server;
 let browser;
 try {
-    const { reviewId, service, delivery, threads } = await seed(tmp);
-    server = await startReviewServer({ instanceId: "screenshots", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT });
+    const seeded = await seed(tmp);
+    const { service, delivery } = seeded;
+    let reviewId = seeded.reviewId;
+    const settings = new SettingsService({ store: seeded.store });
+    // Every theme starts like a first run: the repository has no learning setting yet.
+    const resetLearning = () => rm(seeded.store.settingsFile(), { force: true });
+    server = await startReviewServer({
+        instanceId: "screenshots",
+        getReviewId: () => reviewId,
+        onReviewChange: (id) => {
+            reviewId = id;
+        },
+        service,
+        delivery,
+        settings,
+        webRoot: WEB_ROOT,
+    });
     await mkdir(OUT, { recursive: true });
     browser = await launchBrowser();
     for (const theme of THEMES) {
         console.log(`${theme}:`);
-        await capture(browser, server.url, theme, threads);
+        await capture(browser, server.url, theme, resetLearning);
     }
     if (KEEP) {
         console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);

@@ -83,13 +83,18 @@ async function readUntracked(repoRoot, relPath) {
     return synthesizeAddedFile(relPath, buffer.toString("utf8"));
 }
 
-export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5 }) {
+// scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
+// scope "pending" diffs it against HEAD, so committed work is left out.
+export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }) {
     const head = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
     const branch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
-    const mergeBase = await runGit(repoRoot, ["merge-base", base, "HEAD"], { allowFail: true });
-    const baseCommit = mergeBase.ok && mergeBase.stdout.trim()
-        ? mergeBase.stdout.trim()
-        : (await runGit(repoRoot, ["rev-parse", "--verify", base])).stdout.trim();
+    let baseCommit = head;
+    if (scope !== "pending") {
+        const mergeBase = await runGit(repoRoot, ["merge-base", base, "HEAD"], { allowFail: true });
+        baseCommit = mergeBase.ok && mergeBase.stdout.trim()
+            ? mergeBase.stdout.trim()
+            : (await runGit(repoRoot, ["rev-parse", "--verify", base])).stdout.trim();
+    }
     const pathspec = buildPathspec(paths, exclude);
 
     const diff = await runGit(repoRoot, [
