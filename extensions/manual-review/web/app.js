@@ -1,0 +1,1233 @@
+// Manual review canvas client: renders the diff, inline threads, and composers; talks to the
+// per-instance loopback server with the token from the URL.
+const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
+const STATUSES = ["active", "resolved", "wontfix", "closed"];
+const STALE_QUEUE_MS = 120000;
+
+const state = {
+    review: null,
+    snapshot: null,
+    busy: null,
+    connection: "connecting",
+    view: { type: "overview" },
+    selection: null, // { path, hunk, anchor, from, to }
+    dragging: false,
+    open: new Set(), // explicitly opened composer keys (file/change/reply)
+    pending: new Map(), // composer key -> { clientRequestId, sending, error }
+    expanded: new Set(), // outdated or non-active threads explicitly expanded
+    showResolved: false,
+    collapsedDirs: null, // folder paths folded in the tree (persisted per review)
+    fileFold: new Map(), // path -> folded, for files stacked in a folder view
+    content: new Map(), // `${revisionId}:${path}` -> full-file load state for the file view
+};
+
+const FOLDER_VIEW_ROW_BUDGET = 3000;
+
+const $ = (sel, root = document) => root.querySelector(sel);
+
+function esc(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+const CODE_KEYWORDS = new Set(("abstract as async await base bool boolean break byte case catch char checked class const continue decimal default delegate delete do double else enum event export extends extern false finally fixed float for foreach from function get if implements import in init int interface internal is let lock long namespace new null object operator out override params partial private protected public readonly record ref required return sbyte sealed set short sizeof stackalloc static string struct super switch this throw true try typeof uint ulong unchecked undefined unsafe ushort using var virtual void volatile while with yield").split(" "));
+const highlightedFiles = new WeakMap();
+
+function syntaxLanguage(filePath) {
+    const ext = filePath.split(".").pop().toLowerCase();
+    if (["cs", "js", "mjs", "cjs", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp"].includes(ext)) return "code";
+    if (["xml", "html", "htm", "csproj", "props", "targets", "config", "svg", "xaml"].includes(ext)) return "xml";
+    if (["json", "jsonc"].includes(ext)) return "json";
+    if (["yaml", "yml"].includes(ext)) return "yaml";
+    return null;
+}
+
+// Lexical highlighting only: escape every source fragment and preserve its exact text.
+function highlightLine(text, language, lexical = {}) {
+    if (!language) return esc(text);
+    const out = [];
+    const emit = (value, kind) => out.push(kind ? `<span class="syn-${kind}">${esc(value)}</span>` : esc(value));
+    const tokens = language === "xml"
+        ? /<!--|<\/?[\w:.-]+|\/?>|[\w:.-]+(?=\s*=)|"(?:[^"]*)"|'(?:[^']*)'/g
+        : /\/\*|\/\/.*$|#[^\n]*$|@"(?:""|[^"])*"|\$?"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:0[xX][\da-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|[A-Za-z_$][\w$]*/g;
+    let offset = 0;
+    while (offset < text.length) {
+        if (lexical.comment) {
+            const end = text.indexOf(lexical.comment, offset);
+            const next = end < 0 ? text.length : end + lexical.comment.length;
+            emit(text.slice(offset, next), "comment");
+            offset = next;
+            if (end < 0) break;
+            lexical.comment = null;
+            continue;
+        }
+        tokens.lastIndex = offset;
+        const match = tokens.exec(text);
+        if (!match) {
+            emit(text.slice(offset));
+            break;
+        }
+        emit(text.slice(offset, match.index));
+        const token = match[0];
+        offset = tokens.lastIndex;
+        if ((language === "xml" && token === "<!--") || (language === "code" && token === "/*")) {
+            lexical.comment = language === "xml" ? "-->" : "*/";
+            emit(token, "comment");
+        } else if (language === "xml") {
+            if (token.startsWith("<")) lexical.tag = true;
+            const kind = token.startsWith("<") || /^\/?>$/.test(token) ? "keyword"
+                : /^["']/.test(token) ? "string" : lexical.tag ? "property" : null;
+            emit(token, kind);
+            if (/\/?>$/.test(token)) lexical.tag = false;
+        } else if ((language === "code" || language === "json") && token.startsWith("//")
+            || language === "yaml" && token.startsWith("#")) {
+            emit(token, "comment");
+        } else if (/^(?:@|\$)?["'`]/.test(token)) {
+            emit(token, language === "json" && /^\s*:/.test(text.slice(offset)) ? "property" : "string");
+        } else if (/^\d/.test(token)) {
+            emit(token, "number");
+        } else {
+            const kind = language === "code" && CODE_KEYWORDS.has(token)
+                || language !== "code" && /^(true|false|null)$/.test(token) ? "keyword"
+                : language === "yaml" && /^\s*:/.test(text.slice(offset)) ? "property"
+                : language === "code" && /^[A-Z]/.test(token) ? "type" : null;
+            emit(token, kind);
+        }
+    }
+    return out.join("");
+}
+
+function highlightFile(file) {
+    if (highlightedFiles.has(file)) return highlightedFiles.get(file);
+    const language = syntaxLanguage(file.path);
+    const sides = { old: { next: null, lexical: {} }, new: { next: null, lexical: {} } };
+    const rows = file.hunks.map((hunk) => hunk.rows.map((row) => {
+        let html;
+        for (const [side, line] of [["old", row.o], ["new", row.n]]) {
+            if (line == null) continue;
+            const cursor = sides[side];
+            // Omitted diff context cannot establish a multiline token's state.
+            if (cursor.next !== line) cursor.lexical = {};
+            html = highlightLine(row.s, language, cursor.lexical);
+            cursor.next = line + 1;
+        }
+        return html ?? esc(row.s);
+    }));
+    highlightedFiles.set(file, rows);
+    return rows;
+}
+
+function inline(text) {
+    return text
+        .split(/(`[^`\n]+`)/)
+        .map((part) => (part.length > 1 && part.startsWith("`") && part.endsWith("`")
+            ? `<code>${esc(part.slice(1, -1))}</code>`
+            : esc(part).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")))
+        .join("");
+}
+
+function md(text) {
+    const out = [];
+    let para = [];
+    let code = null;
+    let list = null;
+    const flush = () => {
+        if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+        para = [];
+        if (list) out.push(`</${list}>`);
+        list = null;
+    };
+    for (const line of String(text ?? "").replace(/\r/g, "").split("\n")) {
+        if (code) {
+            if (/^\s*```/.test(line)) {
+                out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+                code = null;
+            } else code.push(line);
+            continue;
+        }
+        if (/^\s*```/.test(line)) {
+            flush();
+            code = [];
+        } else if (!line.trim()) flush();
+        else if (/^#{1,6}\s/.test(line)) {
+            flush();
+            const [, hashes, title] = line.match(/^(#{1,6})\s+(.*)$/);
+            out.push(`<h${hashes.length}>${inline(title)}</h${hashes.length}>`);
+        } else if (/^(?:[-*]|\d+\.)\s+/.test(line)) {
+            const [, bullet, item] = line.match(/^([-*]|\d+\.)\s+(.*)$/);
+            const tag = /^\d/.test(bullet) ? "ol" : "ul";
+            if (list !== tag) {
+                flush();
+                out.push(`<${tag}>`);
+                list = tag;
+            }
+            out.push(`<li>${inline(item)}</li>`);
+        } else {
+            if (list) flush();
+            para.push(line);
+        }
+    }
+    if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+    flush();
+    return `<div class="md">${out.join("")}</div>`;
+}
+
+function ago(iso) {
+    if (!iso) return "";
+    const s = (Date.now() - Date.parse(iso)) / 1000;
+    if (s < 45) return "just now";
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+    return new Date(iso).toLocaleString();
+}
+
+function uuid() {
+    return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+// ---------- API ----------
+
+async function api(method, path, body) {
+    const headers = { "X-MR-Token": TOKEN };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const res = await fetch(`/api/${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(json?.error?.message ?? `${res.status} ${res.statusText}`);
+    return json;
+}
+
+let loading = null;
+let reloadAgain = false;
+async function loadState() {
+    if (loading) {
+        reloadAgain = true;
+        return loading;
+    }
+    loading = (async () => {
+        do {
+            reloadAgain = false;
+            const data = await api("GET", "state");
+            state.review = data.review;
+            if (data.session) state.busy = data.session.busy;
+            const rev = state.review.currentRevisionId;
+            if (rev && state.snapshot?.revisionId !== rev) state.snapshot = await api("GET", `snapshot/${rev}`);
+            restoreView();
+        } while (reloadAgain);
+        render();
+    })().finally(() => {
+        loading = null;
+    });
+    return loading;
+}
+
+let reloadTimer;
+function scheduleReload() {
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => loadState().catch((err) => toast(err.message, true)), 120);
+}
+
+function connect() {
+    const es = new EventSource(`/api/events?t=${encodeURIComponent(TOKEN)}`);
+    es.addEventListener("hello", (e) => {
+        state.connection = "open";
+        state.busy = JSON.parse(e.data).busy;
+        scheduleReload();
+    });
+    es.addEventListener("changed", scheduleReload);
+    // The extension's web assets changed on disk (dev hot reload).
+    es.addEventListener("assets", () => location.reload());
+    es.addEventListener("session", (e) => {
+        state.busy = JSON.parse(e.data).busy;
+        renderTop();
+    });
+    es.onerror = () => {
+        state.connection = "lost";
+        renderTop();
+    };
+}
+
+// ---------- Drafts & view persistence ----------
+
+const draftKey = (key) => `mr:${state.review?.reviewId}:draft:${key}`;
+const getDraft = (key) => localStorage.getItem(draftKey(key)) ?? "";
+function setDraft(key, value) {
+    if (value) localStorage.setItem(draftKey(key), value);
+    else localStorage.removeItem(draftKey(key));
+}
+
+function saveView() {
+    if (state.review) sessionStorage.setItem(`mr:${state.review.reviewId}:view`, JSON.stringify(state.view));
+}
+let viewRestored = false;
+function restoreView() {
+    if (viewRestored || !state.review) return;
+    viewRestored = true;
+    try {
+        const v = JSON.parse(sessionStorage.getItem(`mr:${state.review.reviewId}:view`) ?? "null");
+        if (v?.type) state.view = v;
+    } catch { /* ignore */ }
+}
+
+function collapsedDirs() {
+    if (!state.collapsedDirs) {
+        try {
+            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`mr:${state.review?.reviewId}:collapsed`) ?? "[]"));
+        } catch {
+            state.collapsedDirs = new Set();
+        }
+    }
+    return state.collapsedDirs;
+}
+function setDirCollapsed(dir, collapsed) {
+    const set = collapsedDirs();
+    if (collapsed) set.add(dir);
+    else set.delete(dir);
+    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
+}
+function expandAncestors(path) {
+    for (const dir of collapsedDirs()) {
+        if (dir === "" || path.startsWith(`${dir}/`)) setDirCollapsed(dir, false);
+    }
+}
+
+// ---------- File tree ----------
+
+const inDir = (path, dir) => dir === "" || path.startsWith(`${dir}/`);
+const filesUnder = (dir) => (state.snapshot?.files ?? []).filter((f) => inDir(f.path, dir)).sort((a, b) => a.path.localeCompare(b.path));
+const repoName = () => (state.review?.repoRoot ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "All files";
+
+// Folders first, then files; chains of single-child folders are compacted like ADO ("src/Common/Foo").
+function buildTree(files) {
+    const root = { name: repoName(), path: "", dirs: new Map(), files: [] };
+    for (const f of files) {
+        const parts = f.path.split("/");
+        let node = root;
+        for (let i = 0; i < parts.length - 1; i++) {
+            if (!node.dirs.has(parts[i])) node.dirs.set(parts[i], { name: parts[i], path: parts.slice(0, i + 1).join("/"), dirs: new Map(), files: [] });
+            node = node.dirs.get(parts[i]);
+        }
+        node.files.push(f);
+    }
+    const finish = (node) => {
+        node.children = [...node.dirs.values()].map((dir) => {
+            let d = dir;
+            while (!d.files.length && d.dirs.size === 1) {
+                const only = d.dirs.values().next().value;
+                d = { ...only, name: `${d.name}/${only.name}` };
+            }
+            return finish(d);
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        node.files.sort((a, b) => a.path.localeCompare(b.path));
+        return node;
+    };
+    return finish(root);
+}
+
+// ---------- Diff helpers ----------
+
+function hunkAnchorRange(hunk) {
+    const side = hunk.rows.some((r) => r.t === "add") ? "new" : "old";
+    const key = side === "old" ? "o" : "n";
+    const nums = hunk.rows.map((r) => r[key]).filter((v) => v != null);
+    return nums.length ? { side, startLine: Math.min(...nums), endLine: Math.max(...nums) } : null;
+}
+
+function selectionRange(file, sel) {
+    const rows = file.hunks[sel.hunk].rows.slice(sel.from, sel.to + 1);
+    const side = rows.every((r) => r.t === "del") ? "old" : "new";
+    const key = side === "old" ? "o" : "n";
+    const nums = rows.map((r) => r[key]).filter((v) => v != null);
+    return { side, startLine: Math.min(...nums), endLine: Math.max(...nums) };
+}
+
+const fileOf = (p) => state.snapshot?.files.find((f) => f.path === p) ?? null;
+
+// ADO parity: selecting a file shows the whole file (changes inline); folders show diffs only.
+// The full view interleaves unchanged "gap" hunks with the snapshot hunks, so selection,
+// placement, and anchoring keep working on the same { hunks: [{ rows }] } shape.
+function needsContent(file) {
+    return !file.binary && file.status !== "added" && file.status !== "deleted" && file.hunks.length > 0;
+}
+
+function contentEntry(file) {
+    const rev = state.snapshot?.revisionId;
+    const key = `${rev}:${file.path}`;
+    let entry = state.content.get(key);
+    if (!entry) {
+        entry = { status: "loading" };
+        state.content.set(key, entry);
+        api("GET", `content/${encodeURIComponent(rev)}?path=${encodeURIComponent(file.path)}`)
+            .then((data) => {
+                Object.assign(entry, data.available ? { status: "ready", full: buildFullFile(file, data.lines) } : { status: "unavailable", reason: data.reason });
+            })
+            .catch((err) => Object.assign(entry, { status: "unavailable", reason: err.message }))
+            .finally(() => {
+                if (state.view.type === "file" && state.view.path === file.path && !state.dragging) {
+                    render();
+                    revealPendingJump();
+                }
+            });
+    }
+    return entry;
+}
+
+function buildFullFile(file, lines) {
+    const hunks = [];
+    let nextNew = 1;
+    let nextOld = 1;
+    const gap = (untilNew) => {
+        const rows = [];
+        for (let n = nextNew; n < untilNew; n++) rows.push({ t: "ctx", o: nextOld + (n - nextNew), n, s: lines[n - 1] ?? "" });
+        if (rows.length) hunks.push({ gap: true, rows });
+        nextOld += Math.max(0, untilNew - nextNew);
+        nextNew = Math.max(nextNew, untilNew);
+    };
+    for (const hunk of file.hunks) {
+        gap(hunk.newLines > 0 ? hunk.newStart : hunk.newStart + 1);
+        hunks.push(hunk);
+        nextNew = (hunk.newLines > 0 ? hunk.newStart : hunk.newStart + 1) + hunk.newLines;
+        nextOld = (hunk.oldLines > 0 ? hunk.oldStart : hunk.oldStart + 1) + hunk.oldLines;
+    }
+    gap(lines.length + 1);
+    return { ...file, hunks, full: true };
+}
+
+// The file object rendered for a path in the current view: full file in file view when loaded.
+function displayFile(path) {
+    const file = fileOf(path);
+    if (!file || state.view.type !== "file" || state.view.path !== path || !needsContent(file)) return file;
+    const entry = contentEntry(file);
+    if (state.selection?.path === path && state.selection.full === false) return file;
+    return entry.status === "ready" ? entry.full : file;
+}
+
+// Where a thread renders inside a file view, or null when it cannot be placed in the diff.
+function placeThread(thread, file) {
+    const loc = thread.location;
+    if (!file || !loc || loc.path !== file.path) return null;
+    if (thread.kind === "file") return { where: "file" };
+    if (loc.state === "outdated") return null;
+    const key = loc.side === "old" ? "o" : "n";
+    for (let h = 0; h < file.hunks.length; h++) {
+        const hunk = file.hunks[h];
+        if (thread.kind === "change") {
+            if (hunk.gap) continue;
+            const r = hunkAnchorRange(hunk);
+            if (r && r.side === loc.side && r.startLine <= loc.endLine && r.endLine >= loc.startLine) return { where: "hunk", hunk: h };
+            continue;
+        }
+        for (let i = hunk.rows.length - 1; i >= 0; i--) {
+            if (hunk.rows[i][key] === loc.endLine) return { where: "row", hunk: h, row: i };
+        }
+    }
+    return null;
+}
+
+function isPlaced(thread) {
+    if (thread.kind === "overview") return true;
+    return placeThread(thread, fileOf(thread.location?.path)) !== null;
+}
+
+function lineLabel(loc) {
+    if (!loc || loc.startLine == null) return "";
+    return loc.startLine === loc.endLine ? `L${loc.startLine}` : `L${loc.startLine}–${loc.endLine}`;
+}
+
+function locLabel(thread) {
+    const loc = thread.location ?? thread.anchor ?? {};
+    if (thread.kind === "overview") return "Overall";
+    if (thread.kind === "file") return loc.path;
+    return `${loc.path} ${lineLabel(loc)}${loc.side === "old" ? " (old)" : ""}`;
+}
+
+const STATUS_LETTER = { modified: "M", added: "A", deleted: "D", renamed: "R" };
+
+// ---------- Rendering ----------
+
+function render() {
+    const active = document.activeElement;
+    const focusKey = active?.dataset?.composer;
+    const selStart = active?.selectionStart;
+    const selEnd = active?.selectionEnd;
+    const main = $("#main");
+    const scroll = main.scrollTop;
+    renderTop();
+    renderSide();
+    renderMain();
+    main.scrollTop = scroll;
+    renderRuler();
+    if (focusKey) {
+        const el = document.querySelector(`textarea[data-composer="${CSS.escape(focusKey)}"]`);
+        if (el) {
+            el.focus();
+            if (selStart != null) el.setSelectionRange(selStart, selEnd);
+        }
+    }
+}
+
+function renderTop() {
+    const r = state.review;
+    if (!r) return;
+    const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
+    const git = r.git ?? {};
+    const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => ["queued", "processing"].includes(m.delivery?.state)).length;
+    const parts = [
+        `<span class="title">${esc(r.title)}</span>`,
+        `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span><span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`,
+    ];
+    if (rev) parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
+    if (git.upstream) {
+        const { ahead, behind, name } = git.upstream;
+        parts.push(`<span class="pill${ahead || behind ? " warn" : ""}" title="${esc(name)}">↑${ahead} ↓${behind}</span>`);
+    } else if (git.branch) parts.push(`<span class="pill warn">no upstream</span>`);
+    if (git.uncommittedFiles) parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
+    if (state.connection === "lost") parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
+    else if (state.busy === true) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
+    else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
+    parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
+    $("#top").innerHTML = parts.join("");
+}
+
+function activeCount(pathName) {
+    return state.review.threads.filter((t) => t.status === "active" && t.kind !== "overview" && t.location?.path === pathName).length;
+}
+
+const CHEVRON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const FOLDER_ICON = `<svg class="ficon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 3h4.1l1.5 1.5h6.9c.41 0 .75.34.75.75v7c0 .41-.34.75-.75.75H1.75A.75.75 0 0 1 1 12.25v-8.5c0-.41.34-.75.75-.75Z" fill="currentColor"/></svg>`;
+
+const statHtml = (adds, dels) => `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`;
+
+function treeHtml(node, depth, out) {
+    const v = state.view;
+    const collapsed = collapsedDirs().has(node.path);
+    const files = filesUnder(node.path);
+    const n = files.reduce((sum, f) => sum + activeCount(f.path), 0);
+    const title = node.path === "" ? `${state.review.repoRoot} — all changes` : node.path;
+    out.push(`<div class="nav-item tree dir${v.type === "folder" && v.path === node.path ? " active" : ""}" data-action="nav" data-view="folder" data-path="${esc(node.path)}" style="--depth:${depth}" title="${esc(title)}" role="treeitem" aria-expanded="${!collapsed}">`
+        + `<span class="twisty${collapsed ? "" : " open"}" data-action="fold" data-path="${esc(node.path)}" title="${collapsed ? "Expand" : "Collapse"}">${CHEVRON}</span>`
+        + FOLDER_ICON
+        + `<span class="name">${esc(node.name)}</span>`
+        + `<span class="count${n ? "" : " zero"}">${n}</span>`
+        + `</div>`);
+    if (collapsed) return;
+    for (const child of node.children) treeHtml(child, depth + 1, out);
+    for (const f of node.files) {
+        const letter = STATUS_LETTER[f.status] ?? "M";
+        const fn = activeCount(f.path);
+        out.push(`<div class="nav-item tree${v.type === "file" && v.path === f.path ? " active" : ""}" data-action="nav" data-view="file" data-path="${esc(f.path)}" style="--depth:${depth + 1}" title="${esc(f.path)}${f.untracked ? " (untracked)" : ""}" role="treeitem">`
+            + `<span class="twisty spacer-twisty"></span>`
+            + `<span class="status-letter ${letter}">${letter}</span>`
+            + `<span class="name">${esc(f.path.slice(f.path.lastIndexOf("/") + 1))}</span>`
+            + `<span class="count${fn ? "" : " zero"}">${fn}</span>`
+            + `${statHtml(f.additions, f.deletions)}</div>`);
+    }
+}
+
+function setAllDirsCollapsed(collapse) {
+    const dirs = [];
+    const walk = (node) => {
+        for (const child of node.children) {
+            dirs.push(child.path);
+            walk(child);
+        }
+    };
+    if (collapse) walk(buildTree(state.snapshot?.files ?? []));
+    state.collapsedDirs = new Set(dirs);
+    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
+}
+
+function descriptionHtml() {
+    const d = state.review.description;
+    const stale = d && d.revisionId !== state.review.currentRevisionId;
+    return `<div class="section-head"><h2>Change overview</h2><span class="spacer"></span>`
+        + `<button data-action="discuss-description">Discuss / request edits</button></div>`
+        + `<div class="card description"><div class="muted">Local PR-style draft; not synced to the published PR.`
+        + (d ? ` v${d.version} · based on ${esc(d.revisionId)}${stale ? " · Diff changed; description may need updating." : ""}` : "")
+        + `</div>${d ? md(d.body) : `<div class="empty">No description yet. Ask Copilot below to describe the purpose, behavior, scope, verification, and risks.</div>`}</div>`;
+}
+
+function renderSide() {
+    const r = state.review;
+    const files = state.snapshot?.files ?? [];
+    const v = state.view;
+    const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
+    const html = [
+        `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
+        `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
+        `<div class="section">Files (${files.length})</div>`,
+        `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
+        `<div role="tree">`,
+    ];
+    if (files.length) treeHtml(buildTree(files), 0, html);
+    html.push(`</div>`);
+    $("#side").innerHTML = html.join("");
+}
+
+function renderMain() {
+    const main = $("#main");
+    if (state.view.type === "file") {
+        const file = displayFile(state.view.path);
+        if (file) {
+            main.innerHTML = fileView(file);
+            return;
+        }
+        state.view = { type: "overview" };
+    }
+    if (state.view.type === "folder") {
+        if (filesUnder(state.view.path).length) {
+            main.innerHTML = folderView(state.view.path);
+            return;
+        }
+        state.view = { type: "overview" };
+    }
+    main.innerHTML = state.view.type === "lessons" ? lessonsView() : overviewView();
+}
+
+function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen }) {
+    const draft = getDraft(key);
+    const p = state.pending.get(key);
+    const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
+    const data = [
+        `data-key="${esc(key)}"`,
+        kind ? `data-kind="${kind}"` : "",
+        path ? `data-path="${esc(path)}"` : "",
+        side ? `data-side="${side}"` : "",
+        startLine ? `data-start="${startLine}"` : "",
+        endLine ? `data-end="${endLine}"` : "",
+    ].join(" ");
+    return `<div class="composer${open ? " open" : ""}" ${data}>`
+        + (label ? `<div class="label">${esc(label)}</div>` : "")
+        + `<textarea data-composer="${esc(key)}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${esc(draft)}</textarea>`
+        + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
+        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to send · Esc to close</span>`
+        + `<button data-action="cancel" data-key="${esc(key)}">Cancel</button>`
+        + `<button class="primary" data-action="submit" data-key="${esc(key)}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button></div>`
+        + `</div>`;
+}
+
+function deliveryHtml(m) {
+    const d = m.delivery;
+    if (!d) return "";
+    const resend = (label) => `<button class="link" data-action="retry" data-message="${esc(m.messageId)}">${label}</button>`;
+    switch (d.state) {
+        case "saving":
+            return `<span class="delivery saving">Sending to Copilot…</span>`;
+        case "queued": {
+            const stale = state.busy === false && d.queuedAt && Date.now() - Date.parse(d.queuedAt) > STALE_QUEUE_MS;
+            return `<span class="delivery queued">Queued for Copilot${stale ? ` · ${resend("Resend")}` : ""}</span>`;
+        }
+        case "processing":
+            return `<span class="delivery processing">Copilot is working…</span>`;
+        case "replied":
+            return `<span class="delivery replied">✓ Replied</span>`;
+        case "no-reply":
+            return `<span class="delivery no-reply" title="Copilot finished without replying in this thread">No reply · ${resend("Resend")}</span>`;
+        case "failed":
+            return `<span class="delivery failed" title="${esc(d.error ?? "")}">Delivery failed · ${resend("Retry")}</span>`;
+        default:
+            return "";
+    }
+}
+
+function messageHtml(m) {
+    const agent = m.author === "agent";
+    const lessons = (m.lessonIds ?? []).map((id) => state.review.lessons.find((l) => l.lessonId === id)).filter(Boolean);
+    return `<div class="msg" data-message-id="${esc(m.messageId)}">`
+        + `<div class="msg-head"><span class="avatar${agent ? " agent" : ""}">${agent ? "AI" : "Me"}</span>`
+        + `<span class="who">${agent ? "Copilot" : "You"}</span><span class="when" title="${esc(m.createdAt)}">${esc(ago(m.createdAt))}</span>`
+        + (agent && m.outcome ? `<span class="outcome ${esc(m.outcome)}">${esc(m.outcome)}</span>` : "")
+        + deliveryHtml(m)
+        + `</div>${md(m.body)}`
+        + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
+        + (lessons.length ? `<div class="lessons">Learned:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}</li>`).join("")}</ul></div>` : "")
+        + `</div>`;
+}
+
+function threadHtml(t, { showLocation = false } = {}) {
+    const loc = t.location ?? {};
+    const outdated = loc.state === "outdated";
+    const collapsible = t.status !== "active" || outdated;
+    const collapsed = collapsible && !state.expanded.has(t.threadId);
+    const pending = t.messages.filter((m) => m.delivery && m.delivery.state !== "replied");
+    const notInDiff = !outdated && !isPlaced(t);
+    const moved = t.anchor?.startLine != null && loc.startLine != null && (t.anchor.startLine !== loc.startLine || t.anchor.endLine !== loc.endLine);
+    const options = STATUSES.map((s) => `<option value="${s}"${s === t.status ? " selected" : ""}>${s === "wontfix" ? "won't fix" : s}</option>`).join("");
+    const head = `<div class="thread-head">`
+        + `<span class="badge kind">${t.kind === "change" ? "change" : t.kind}</span>`
+        + `<span class="loc">${showLocation ? `<button class="link" data-action="jump" data-thread="${esc(t.threadId)}">${esc(locLabel(t))}</button>` : esc(locLabel(t))}`
+        + (moved ? ` <span class="muted" title="Line numbers changed since ${esc(t.anchor.revisionId)}">(originally ${esc(lineLabel(t.anchor))} in ${esc(t.anchor.revisionId)})</span>` : "")
+        + `</span>`
+        + (outdated ? `<span class="badge outdated" title="The commented code changed or was removed">Outdated</span>` : "")
+        + (notInDiff ? `<span class="badge outdated" title="This location is not part of the current diff">Not in diff</span>` : "")
+        + (t.status !== "active" ? `<span class="badge st-${t.status}">${t.status === "wontfix" ? "won't fix" : t.status}</span>` : "")
+        + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status">${options}</select>`
+        + (collapsed ? pending.map(deliveryHtml).join("") : "")
+        + (collapsible ? `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>` : "")
+        + `</div>`;
+    const original = outdated && t.anchor?.selectedLines?.length
+        ? `<div class="original muted">Originally commented code (${esc(t.anchor.revisionId)}, ${esc(lineLabel(t.anchor))}):<pre>${esc(t.anchor.selectedLines.join("\n"))}</pre></div>`
+        : "";
+    const reply = composerHtml(`reply:${t.threadId}`, { placeholder: "Reply…" });
+    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map(messageHtml).join("")}${reply}</div></div>`;
+}
+
+function overviewView() {
+    const r = state.review;
+    const overall = r.threads.filter((t) => t.kind === "overview" && t.status === "active");
+    const unplaced = r.threads.filter((t) => t.kind !== "overview" && t.status === "active" && !isPlaced(t));
+    const others = r.threads.filter((t) => t.kind !== "overview");
+    const active = others.filter((t) => t.status === "active");
+    const done = r.threads.filter((t) => t.status !== "active");
+    const listRow = (t) => {
+        const last = t.messages[t.messages.length - 1];
+        const lastUser = [...t.messages].reverse().find((m) => m.author === "user");
+        return `<div class="list-row"><span class="badge kind">${t.kind}</span>`
+            + `<button class="link loc" data-action="jump" data-thread="${esc(t.threadId)}">${esc(locLabel(t))}</button>`
+            + `<span class="snippet">${esc(last.author === "agent" ? "Copilot: " : "")}${esc(last.body.replace(/\s+/g, " ").slice(0, 160))}</span>`
+            + (lastUser ? deliveryHtml(lastUser) : "")
+            + `</div>`;
+    };
+    const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
+    return descriptionHtml()
+        + `<h2>Overall discussion</h2>`
+        + (overall.length ? overall.map((t) => threadHtml(t)).join("") : `<div class="empty">No overall comments yet.</div>`)
+        + `<div class="thread">${composerHtml("overview:new", { kind: "overview", label: "Discuss the change or request description edits", placeholder: "Ask to revise the description, discuss the design, or request a change…", alwaysOpen: true })}</div>`
+        + (unplaced.length ? `<h2>Comments outside the current diff (${unplaced.length})</h2>${unplaced.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
+        + `<h2>Active threads (${active.length})</h2><div class="card">${active.length ? active.map(listRow).join("") : `<div class="empty">No active threads. Select lines in a file to comment.</div>`}</div>`
+        + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
+        + `<h2>Revisions</h2><div class="card">${revs || `<div class="empty">No revisions.</div>`}</div>`;
+}
+
+function lessonsView() {
+    const lessons = state.review.lessons;
+    if (!lessons.length) return `<h2>Lessons learned</h2><div class="empty">Copilot records reusable rules here when your comments reveal a preference.</div>`;
+    const rows = [...lessons].reverse().map((l) => `<tr><td><span class="badge">${esc(l.scope)}</span></td><td>${inline(l.rule)}</td><td class="mono muted">${esc(l.savedTo ?? "")}</td><td><button class="link" data-action="jump" data-thread="${esc(l.threadId)}">thread</button><div class="muted">${esc(ago(l.createdAt))}</div></td></tr>`).join("");
+    return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function fileView(file, { stacked = false, folded = false } = {}) {
+    const threads = state.review.threads.filter((t) => t.kind !== "overview" && t.location?.path === file.path);
+    const placed = new Map();
+    const unplaced = [];
+    for (const t of threads) {
+        const p = placeThread(t, file);
+        if (!p) {
+            unplaced.push(t);
+            continue;
+        }
+        const key = p.where === "file" ? "file" : p.where === "hunk" ? `h${p.hunk}` : `r${p.hunk}:${p.row}`;
+        if (!placed.has(key)) placed.set(key, []);
+        placed.get(key).push(t);
+    }
+    const highlighted = new Set();
+    for (const t of threads) {
+        if (t.kind !== "line" || t.status !== "active" || t.location?.state === "outdated") continue;
+        for (let n = t.location.startLine; n <= t.location.endLine; n++) highlighted.add(`${t.location.side}:${n}`);
+    }
+
+    const letter = STATUS_LETTER[file.status] ?? "M";
+    const fileKey = `file:${file.path}`;
+    const activeHere = threads.filter((t) => t.status === "active").length;
+    const pathHtml = stacked
+        ? `<button class="link path-link" data-action="nav" data-view="file" data-path="${esc(file.path)}" title="Open only this file">${esc(file.path)}</button>`
+        : esc(file.path);
+    const html = [`<section class="file-section" data-file="${esc(file.path)}">`,
+        `<div class="file-head${stacked ? " stacked" : ""}">`
+        + (stacked ? `<span class="twisty${folded ? "" : " open"}" data-action="fold-file" data-path="${esc(file.path)}" title="${folded ? "Show diff" : "Hide diff"}">${CHEVRON}</span>` : "")
+        + `<span class="status-letter ${letter}">${letter}</span><span class="path">${pathHtml}${file.oldPath && file.oldPath !== file.path ? ` <span class="muted">(from ${esc(file.oldPath)})</span>` : ""}${file.untracked ? ` <span class="badge">untracked</span>` : ""}</span>`
+        + (stacked && folded && activeHere ? `<span class="count">${activeHere}</span>` : "")
+        + `<span class="stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`
+        + `<button data-action="open" data-key="${esc(fileKey)}" data-path="${esc(file.path)}">Comment on file</button></div>`];
+    if (folded) {
+        html.push(`</section>`);
+        return html.join("");
+    }
+    html.push((placed.get("file") ?? []).map((t) => threadHtml(t)).join(""));
+    if (state.open.has(fileKey) || getDraft(fileKey) || state.pending.has(fileKey)) {
+        html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
+    }
+    if (file.binary) html.push(`<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
+    if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+    if (!stacked && !file.full && needsContent(file)) {
+        const entry = contentEntry(file);
+        const why = { stale: "the working tree changed since this revision; Refresh to see the full file", "too-large": "the file is too large", missing: "the file is missing from the working tree", "base-unavailable": "the base revision cannot be read" }[entry.reason] ?? entry.reason;
+        const note = entry.status === "loading" ? "Loading full file…"
+            : entry.status === "ready" ? "Showing changes only until the current line selection is closed."
+            : `Showing changes only: ${esc(why)}.`;
+        html.push(`<div class="muted full-note">${note}</div>`);
+    }
+
+    const sel = state.selection?.path === file.path ? state.selection : null;
+    const selRange = sel ? selectionRange(file, sel) : null;
+    const syntax = highlightFile(file);
+    html.push(`<div class="diff${file.full ? " full" : ""}">`);
+    file.hunks.forEach((hunk, h) => {
+        const range = hunk.gap ? null : hunkAnchorRange(hunk);
+        const changeKey = range ? `change:${file.path}:${range.side}:${range.startLine}-${range.endLine}` : null;
+        if (!hunk.gap) {
+            html.push(file.full
+                ? `<div class="hunk-head change-bar"><span class="h muted">Change ${esc(lineLabel(range ?? {}))}</span>${range ? `<button data-action="open" data-key="${esc(changeKey)}">Discuss this change</button>` : ""}</div>`
+                : `<div class="hunk-head"><span class="h" title="${esc(hunk.header)}">${esc(hunk.header)}</span>${range ? `<button data-action="open" data-key="${esc(changeKey)}">Discuss this change</button>` : ""}</div>`);
+        }
+        const hunkThreads = placed.get(`h${h}`) ?? [];
+        const showChangeComposer = changeKey && (state.open.has(changeKey) || getDraft(changeKey) || state.pending.has(changeKey));
+        if (hunkThreads.length || showChangeComposer) {
+            html.push(`<div class="hunk-threads">${hunkThreads.map((t) => threadHtml(t)).join("")}`
+                + (showChangeComposer ? `<div class="thread">${composerHtml(changeKey, { kind: "change", path: file.path, side: range.side, startLine: range.startLine, endLine: range.endLine, label: `Discuss this change (${range.side === "old" ? "old " : ""}${lineLabel(range)})`, alwaysOpen: true })}</div>` : "")
+                + `</div>`);
+        }
+        html.push(`<table class="rows"><colgroup><col style="width:52px"><col style="width:52px"><col style="width:22px"><col></colgroup><tbody>`);
+        hunk.rows.forEach((row, i) => {
+            const selected = sel && sel.hunk === h && i >= sel.from && i <= sel.to;
+            const hl = (row.n != null && highlighted.has(`new:${row.n}`)) || (row.t === "del" && highlighted.has(`old:${row.o}`));
+            const prefix = row.t === "add" ? "+" : row.t === "del" ? "-" : " ";
+            html.push(`<tr class="row ${row.t}${selected ? " sel" : ""}${hl ? " hl" : ""}" data-h="${h}" data-i="${i}">`
+                + `<td class="ln">${row.o ?? ""}</td><td class="ln">${row.n ?? ""}</td><td class="gut"><span>+</span></td>`
+                + `<td class="code" data-p="${prefix}">${syntax[h][i]}</td></tr>`);
+            const rowThreads = placed.get(`r${h}:${i}`) ?? [];
+            const composerHere = sel && !state.dragging && sel.hunk === h && sel.to === i;
+            if (rowThreads.length || composerHere) {
+                const lineKey = composerHere ? `line:${file.path}:${selRange.side}:${selRange.startLine}-${selRange.endLine}` : null;
+                html.push(`<tr class="inline"><td colspan="4">${rowThreads.map((t) => threadHtml(t)).join("")}`
+                    + (composerHere ? `<div class="thread">${composerHtml(lineKey, { kind: "line", path: file.path, side: selRange.side, startLine: selRange.startLine, endLine: selRange.endLine, label: `Comment on ${selRange.side === "old" ? "old " : ""}${lineLabel(selRange)}`, alwaysOpen: true })}</div>` : "")
+                    + `</td></tr>`);
+            }
+        });
+        html.push(`</tbody></table>`);
+    });
+    html.push(`</div>`);
+    if (unplaced.length) {
+        html.push(`<h2>Comments outside the current diff (${unplaced.length})</h2>${unplaced.map((t) => threadHtml(t)).join("")}`);
+    }
+    html.push(`</section>`);
+    return html.join("");
+}
+
+// Folder selection shows every changed file under it, stacked, like ADO's Files tab.
+// Past a row budget, files start folded so huge folders stay responsive.
+function folderView(dir) {
+    const files = filesUnder(dir);
+    const adds = files.reduce((s, f) => s + f.additions, 0);
+    const dels = files.reduce((s, f) => s + f.deletions, 0);
+    const html = [`<div class="folder-head">${FOLDER_ICON}<span class="path">${esc(dir === "" ? repoName() : dir)}</span>`
+        + `<span class="muted">${files.length} file${files.length === 1 ? "" : "s"}</span>`
+        + `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`
+        + `<span class="spacer"></span><button class="link" data-action="fold-all" data-fold="1">Collapse all</button><button class="link" data-action="fold-all" data-fold="0">Expand all</button></div>`];
+    let rows = 0;
+    for (const f of files) {
+        const size = f.hunks.reduce((s, h) => s + h.rows.length, 0);
+        const folded = state.fileFold.has(f.path) ? state.fileFold.get(f.path) : rows + size > FOLDER_VIEW_ROW_BUDGET && rows > 0;
+        if (!folded) rows += size;
+        html.push(fileView(f, { stacked: true, folded }));
+    }
+    return html.join("");
+}
+
+// ---------- Actions ----------
+
+let toastTimer;
+function toast(text, error = false) {
+    const el = $("#toast");
+    el.textContent = text;
+    el.className = error ? "error" : "";
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+        el.hidden = true;
+    }, error ? 6000 : 2500);
+}
+
+function navigate(view) {
+    state.view = view;
+    state.selection = null;
+    state.pendingJump = null;
+    if (view.type === "file" || view.type === "folder") expandAncestors(view.path);
+    saveView();
+    render();
+    $("#main").scrollTop = 0;
+}
+
+function focusComposer(key) {
+    const el = document.querySelector(`textarea[data-composer="${CSS.escape(key)}"]`);
+    if (el) {
+        el.focus();
+        el.scrollIntoView({ block: "nearest" });
+    }
+}
+
+function jumpToThread(threadId) {
+    const t = state.review.threads.find((x) => x.threadId === threadId);
+    if (!t) return;
+    if (t.status !== "active" || t.location?.state === "outdated") state.expanded.add(threadId);
+    const inFile = t.kind !== "overview" && isPlaced(t) && fileOf(t.location.path);
+    const unplacedInFile = t.kind !== "overview" && !isPlaced(t) && fileOf(t.location?.path);
+    if ((inFile || unplacedInFile) && state.view.type === "folder" && inDir(t.location.path, state.view.path)) {
+        state.fileFold.set(t.location.path, false);
+        render();
+    } else {
+        navigate(inFile || unplacedInFile ? { type: "file", path: t.location.path } : { type: "overview" });
+    }
+    state.pendingJump = threadId;
+    revealPendingJump();
+}
+
+// Scrolls to a jumped-to thread; retried after the full file loads, since it may move or appear then.
+function revealPendingJump() {
+    const threadId = state.pendingJump;
+    if (!threadId) return;
+    const el = document.querySelector(`[data-thread-id="${CSS.escape(threadId)}"]`);
+    if (el) {
+        el.scrollIntoView({ block: "center" });
+        el.classList.add("flash");
+        setTimeout(() => el.classList.remove("flash"), 1600);
+    }
+    const loading = state.view.type === "file" && [...state.content.values()].some((e) => e.status === "loading");
+    if (!loading) state.pendingJump = null;
+}
+
+function closeComposer(key, discard) {
+    if (discard) setDraft(key, "");
+    state.open.delete(key);
+    state.pending.delete(key);
+    if (key.startsWith("line:")) state.selection = null;
+    if (document.activeElement?.dataset?.composer === key) document.activeElement.blur();
+    render();
+}
+
+async function submit(key) {
+    const box = document.querySelector(`.composer[data-key="${CSS.escape(key)}"]`);
+    const textarea = box?.querySelector("textarea");
+    if (!box || !textarea) return;
+    const body = textarea.value.trim();
+    if (!body) {
+        textarea.focus();
+        return;
+    }
+    setDraft(key, textarea.value);
+    const pending = state.pending.get(key) ?? { clientRequestId: uuid() };
+    pending.sending = true;
+    pending.error = null;
+    state.pending.set(key, pending);
+    render();
+    try {
+        let res;
+        if (key.startsWith("reply:")) {
+            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: state.review.description?.version ?? 0 });
+        } else {
+            const d = box.dataset;
+            res = await api("POST", "threads", {
+                kind: d.kind,
+                path: d.path,
+                side: d.side,
+                startLine: d.start ? Number(d.start) : undefined,
+                endLine: d.end ? Number(d.end) : undefined,
+                revisionId: state.review.currentRevisionId,
+                descriptionVersion: state.review.description?.version ?? 0,
+                body,
+                clientRequestId: pending.clientRequestId,
+            });
+        }
+        setDraft(key, "");
+        state.pending.delete(key);
+        state.open.delete(key);
+        if (key.startsWith("line:")) state.selection = null;
+        document.activeElement?.blur?.();
+        await loadState();
+        if (res?.threadId && !key.startsWith("reply:")) {
+            const el = document.querySelector(`[data-thread-id="${CSS.escape(res.threadId)}"]`);
+            el?.classList.add("flash");
+            setTimeout(() => el?.classList.remove("flash"), 1600);
+        }
+    } catch (err) {
+        pending.sending = false;
+        pending.error = err.message;
+        render();
+    }
+}
+
+async function onClick(e) {
+    const target = e.target.closest("[data-action]");
+    if (!target || target.tagName === "SELECT") return;
+    const { action } = target.dataset;
+    try {
+        switch (action) {
+            case "discuss-description":
+                focusComposer("overview:new");
+                break;
+            case "nav": {
+                const { view, path } = target.dataset;
+                if (view === "folder" && state.view.type === "folder" && state.view.path === path) {
+                    setDirCollapsed(path, !collapsedDirs().has(path));
+                    render();
+                } else {
+                    navigate(view === "file" || view === "folder" ? { type: view, path } : { type: view });
+                }
+                break;
+            }
+            case "fold":
+                setDirCollapsed(target.dataset.path, !collapsedDirs().has(target.dataset.path));
+                render();
+                break;
+            case "fold-tree":
+                setAllDirsCollapsed(target.dataset.fold === "1");
+                render();
+                break;
+            case "fold-file": {
+                const path = target.dataset.path;
+                state.fileFold.set(path, target.classList.contains("open"));
+                render();
+                document.querySelector(`.file-section[data-file="${CSS.escape(path)}"]`)?.scrollIntoView({ block: "nearest" });
+                break;
+            }
+            case "fold-all":
+                for (const f of filesUnder(state.view.path ?? "")) state.fileFold.set(f.path, target.dataset.fold === "1");
+                render();
+                break;
+            case "refresh":
+                target.disabled = true;
+                await api("POST", "refresh", {});
+                await loadState();
+                toast("Refreshed from the working tree");
+                break;
+            case "open":
+                if (target.dataset.path) state.fileFold.set(target.dataset.path, false);
+                state.open.add(target.dataset.key);
+                render();
+                focusComposer(target.dataset.key);
+                break;
+            case "cancel":
+                closeComposer(target.dataset.key, true);
+                break;
+            case "submit":
+                await submit(target.dataset.key);
+                break;
+            case "retry":
+                await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/retry`, {});
+                await loadState();
+                toast("Sent to Copilot again");
+                break;
+            case "toggle": {
+                const id = target.dataset.thread;
+                if (state.expanded.has(id)) state.expanded.delete(id);
+                else state.expanded.add(id);
+                render();
+                break;
+            }
+            case "jump":
+                jumpToThread(target.dataset.thread);
+                break;
+            default:
+                break;
+        }
+    } catch (err) {
+        toast(err.message, true);
+        if (action === "refresh") target.disabled = false;
+    }
+}
+
+async function onChange(e) {
+    const el = e.target;
+    if (el.dataset?.action !== "status") return;
+    try {
+        await api("POST", `threads/${encodeURIComponent(el.dataset.thread)}/status`, { status: el.value });
+        if (el.value !== "active") state.expanded.delete(el.dataset.thread);
+        await loadState();
+    } catch (err) {
+        toast(err.message, true);
+        await loadState().catch(() => {});
+    }
+}
+
+function onInput(e) {
+    const el = e.target;
+    if (el.dataset?.composer) {
+        setDraft(el.dataset.composer, el.value);
+        el.closest(".composer")?.classList.add("open");
+    }
+}
+
+function onKeyDown(e) {
+    const el = e.target;
+    const key = el.dataset?.composer;
+    if (!key) return;
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        submit(key);
+    } else if (e.key === "Escape") {
+        e.preventDefault();
+        if (key.startsWith("reply:") && !el.value.trim()) {
+            el.closest(".composer")?.classList.remove("open");
+            el.blur();
+        } else if (!el.value.trim()) closeComposer(key, true);
+        else el.blur();
+    }
+}
+
+function onFocusIn(e) {
+    const el = e.target;
+    if (el.dataset?.composer) el.closest(".composer")?.classList.add("open");
+}
+
+function onFocusOut(e) {
+    const el = e.target;
+    const key = el.dataset?.composer;
+    if (!key || !key.startsWith("reply:")) return;
+    setTimeout(() => {
+        const box = el.closest(".composer");
+        if (box && !el.value.trim() && !box.contains(document.activeElement)) box.classList.remove("open");
+    }, 150);
+}
+
+// ---------- Overview ruler (change markers beside the scrollbar) ----------
+
+// Merges adjacent rows of the same kind so a long change becomes one marker, not one per line.
+function rulerMarks(items, scrollHeight, minPx = 3) {
+    const marks = [];
+    for (const it of items) {
+        const last = marks[marks.length - 1];
+        if (last && last.kind === it.kind && it.top <= last.bottom + 1) {
+            last.bottom = Math.max(last.bottom, it.top + it.height);
+            continue;
+        }
+        marks.push({ kind: it.kind, top: it.top, bottom: it.top + it.height });
+    }
+    return marks.map((m) => ({
+        kind: m.kind,
+        top: m.top,
+        topPct: (m.top / scrollHeight) * 100,
+        heightPct: (Math.max(m.bottom - m.top, 0) / scrollHeight) * 100,
+        minPx,
+    }));
+}
+
+function renderRuler() {
+    const main = $("#main");
+    const ruler = $("#ruler");
+    if (!main || !ruler) return;
+    const mainRect = main.getBoundingClientRect();
+    ruler.style.right = `${main.offsetWidth - main.clientWidth}px`;
+    const offset = main.scrollTop - mainRect.top;
+    const items = [];
+    for (const el of main.querySelectorAll("tr.row.add, tr.row.del, tr.inline")) {
+        const r = el.getBoundingClientRect();
+        if (!r.height) continue;
+        const kind = el.classList.contains("inline") ? "thread" : el.classList.contains("add") ? "add" : "del";
+        items.push({ kind, top: r.top + offset, height: r.height });
+    }
+    const scrollable = main.scrollHeight > main.clientHeight;
+    ruler.hidden = !scrollable || items.length === 0;
+    if (ruler.hidden) {
+        ruler.innerHTML = "";
+        return;
+    }
+    ruler.innerHTML = rulerMarks(items, main.scrollHeight)
+        .map((m) => `<div class="mark ${m.kind}" data-top="${m.top}" style="top:${m.topPct}%;height:max(${m.minPx}px, ${m.heightPct}%)"></div>`)
+        .join("")
+        + `<div class="viewport"></div>`;
+    paintRulerViewport();
+}
+
+function paintRulerViewport() {
+    const main = $("#main");
+    const vp = $("#ruler .viewport");
+    if (!main || !vp) return;
+    vp.style.top = `${(main.scrollTop / main.scrollHeight) * 100}%`;
+    vp.style.height = `${(main.clientHeight / main.scrollHeight) * 100}%`;
+}
+
+function onRulerClick(e) {
+    const main = $("#main");
+    const ruler = $("#ruler");
+    const mark = e.target.closest(".mark");
+    const target = mark
+        ? Number(mark.dataset.top)
+        : ((e.clientY - ruler.getBoundingClientRect().top) / ruler.clientHeight) * main.scrollHeight;
+    main.scrollTo({ top: Math.max(0, target - main.clientHeight / 3), behavior: "smooth" });
+}
+
+// ---------- Line selection (click / shift-click / drag on line numbers or "+") ----------
+
+function rowFromEvent(e) {
+    const tr = e.target.closest("tr.row");
+    const path = tr?.closest("[data-file]")?.dataset.file;
+    if (!tr || !path) return null;
+    return { path, h: Number(tr.dataset.h), i: Number(tr.dataset.i), full: Boolean(tr.closest(".diff")?.classList.contains("full")) };
+}
+
+function paintSelection() {
+    const sel = state.selection;
+    for (const tr of document.querySelectorAll("tr.row")) {
+        const on = sel && tr.closest("[data-file]")?.dataset.file === sel.path && Number(tr.dataset.h) === sel.hunk && Number(tr.dataset.i) >= sel.from && Number(tr.dataset.i) <= sel.to;
+        tr.classList.toggle("sel", Boolean(on));
+    }
+}
+
+function onMouseDown(e) {
+    if (e.button !== 0 || !e.target.closest("td.ln, td.gut")) return;
+    const pos = rowFromEvent(e);
+    if (!pos) return;
+    e.preventDefault();
+    const { path } = pos;
+    const sel = state.selection;
+    if (e.shiftKey && sel && sel.path === path && sel.hunk === pos.h && sel.full === pos.full) {
+        sel.from = Math.min(sel.anchor, pos.i);
+        sel.to = Math.max(sel.anchor, pos.i);
+    } else {
+        state.selection = { path, hunk: pos.h, anchor: pos.i, from: pos.i, to: pos.i, full: pos.full };
+    }
+    state.dragging = true;
+    paintSelection();
+}
+
+function onMouseOver(e) {
+    if (!state.dragging) return;
+    const pos = rowFromEvent(e);
+    const sel = state.selection;
+    if (!pos || !sel || pos.path !== sel.path || pos.h !== sel.hunk) return;
+    sel.from = Math.min(sel.anchor, pos.i);
+    sel.to = Math.max(sel.anchor, pos.i);
+    paintSelection();
+}
+
+function onMouseUp() {
+    if (!state.dragging) return;
+    state.dragging = false;
+    const file = displayFile(state.selection?.path);
+    if (!file) return;
+    const r = selectionRange(file, state.selection);
+    render();
+    focusComposer(`line:${file.path}:${r.side}:${r.startLine}-${r.endLine}`);
+}
+
+// ---------- Boot ----------
+
+document.addEventListener("click", onClick);
+document.addEventListener("change", onChange);
+document.addEventListener("input", onInput);
+document.addEventListener("keydown", onKeyDown);
+document.addEventListener("focusin", onFocusIn);
+document.addEventListener("focusout", onFocusOut);
+document.addEventListener("mousedown", onMouseDown);
+document.addEventListener("mouseover", onMouseOver);
+document.addEventListener("mouseup", onMouseUp);
+document.addEventListener("click", (e) => {
+    if (e.target.closest?.("#ruler")) onRulerClick(e);
+    else requestAnimationFrame(renderRuler);
+});
+document.addEventListener("scroll", (e) => { if (e.target?.id === "main") paintRulerViewport(); }, true);
+globalThis.addEventListener?.("resize", () => requestAnimationFrame(renderRuler));
+
+setInterval(() => {
+    if (!state.review || state.dragging) return;
+    if (document.activeElement?.tagName === "TEXTAREA") renderTop();
+    else render();
+}, 30000);
+
+if (!TOKEN) {
+    $("#top").innerHTML = `<span class="del">Missing access token. Reopen the canvas.</span>`;
+} else {
+    loadState()
+        .catch((err) => {
+            $("#top").innerHTML = `<span class="del">${esc(err.message)}</span>`;
+        })
+        .finally(connect);
+}
