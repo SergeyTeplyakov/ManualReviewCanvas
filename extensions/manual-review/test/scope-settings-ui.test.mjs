@@ -639,6 +639,9 @@ test("Send now, Discard, Submit review and the delivery question call the server
         assert.deepEqual(await act("delivery-choose", { mode }), [`POST /api/delivery {"mode":"${mode}"}`, "GET /api/state"]);
         assert.deepEqual(toast(), [text, false], `${mode} ${submitted}`);
     }
+    replies.set("/api/delivery", jsonResponse({ mode: "immediate", submitted: 2, error: "session closed" }));
+    await act("delivery-choose", { mode: "immediate" });
+    assert.deepEqual(toast(), ["Sending each comment now, but 2 waiting drafts could not be sent: session closed", true]);
     replies.set("/api/delivery", jsonResponse({ mode: null, submitted: 0 }));
     assert.deepEqual(await act("delivery-reask"), ['POST /api/delivery {"mode":null}', "GET /api/state"]);
 });

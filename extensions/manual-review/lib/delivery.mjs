@@ -29,7 +29,8 @@ export class Delivery extends EventEmitter {
         this.fallbackOwner = `delivery-${randomUUID()}`;
         this.busy = null;
         this.bySessionMessageId = new Map();
-        this.seenSessionMessageIds = new Set();
+        // Session message ids seen before send() resolved, and whether their turn has already finished.
+        this.seenSessionMessageIds = new Map();
         this.touched = new Set();
         this.inFlight = new Map();
     }
@@ -109,9 +110,12 @@ export class Delivery extends EventEmitter {
                 error: null,
             }, c);
         }
-        // The user.message event can arrive before send() resolves.
-        if (sessionMessageId && this.seenSessionMessageIds.delete(sessionMessageId)) {
-            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, this.processingPatch(), c);
+        // The user.message event can arrive before send() resolves, and its turn may already have finished.
+        const seen = sessionMessageId ? this.seenSessionMessageIds.get(sessionMessageId) : undefined;
+        if (seen) {
+            this.seenSessionMessageIds.delete(sessionMessageId);
+            const patch = seen.finished ? { ...this.processingPatch(), state: "no-reply" } : this.processingPatch();
+            for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, patch, c);
         }
         return { delivered: true, sessionMessageId };
     }
@@ -140,8 +144,8 @@ export class Delivery extends EventEmitter {
         }
         if (!targets.length) {
             if (data.messageId) {
-                this.seenSessionMessageIds.add(data.messageId);
-                if (this.seenSessionMessageIds.size > 200) this.seenSessionMessageIds.delete(this.seenSessionMessageIds.values().next().value);
+                this.seenSessionMessageIds.set(data.messageId, { finished: false });
+                if (this.seenSessionMessageIds.size > 200) this.seenSessionMessageIds.delete(this.seenSessionMessageIds.keys().next().value);
             }
             return;
         }
@@ -158,6 +162,7 @@ export class Delivery extends EventEmitter {
 
     async onIdle() {
         this.setBusy(false);
+        for (const seen of this.seenSessionMessageIds.values()) seen.finished = true;
         const ids = new Set([...this.touched, ...this.reviewIds()]);
         for (const reviewId of ids) {
             try {

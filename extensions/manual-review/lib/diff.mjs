@@ -30,6 +30,16 @@ function stripSidePrefix(p) {
     return p.replace(/^[ab]\//, "");
 }
 
+// For an unquoted header whose two sides name the same path ("a/P b/P"), returns P. A path can itself contain
+// " b/", which makes the split ambiguous to a regex, but equal halves pin it down.
+function sameSidePath(rest) {
+    if (!rest.startsWith("a/") || (rest.length - 5) % 2 !== 0) return null;
+    const n = (rest.length - 5) / 2;
+    if (n <= 0) return null;
+    const p = rest.slice(2, 2 + n);
+    return rest.slice(2 + n) === ` b/${p}` ? p : null;
+}
+
 function newFile() {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
@@ -77,8 +87,12 @@ export function parseUnifiedDiff(text) {
             file = newFile();
             files.push(file);
             hunk = null;
-            const m = /^diff --git ("(?:[^"\\]|\\.)*"|a\/.*) ("(?:[^"\\]|\\.)*"|b\/.*)$/.exec(line);
-            if (m) {
+            const same = sameSidePath(line.slice("diff --git ".length));
+            const m = same === null && /^diff --git ("(?:[^"\\]|\\.)*"|a\/.*) ("(?:[^"\\]|\\.)*"|b\/.*)$/.exec(line);
+            if (same !== null) {
+                file.oldPath = same;
+                file.path = same;
+            } else if (m) {
                 file.oldPath = stripSidePrefix(unquotePath(m[1]));
                 file.path = stripSidePrefix(unquotePath(m[2]));
             }

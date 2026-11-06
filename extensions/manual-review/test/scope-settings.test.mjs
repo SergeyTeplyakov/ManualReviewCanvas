@@ -377,6 +377,17 @@ test("normalizeRemoteUrl keeps a non-default port, which can name a different se
     assert.equal(normalizeRemoteUrl("git://host.example:9418/o/r"), "host.example/o/r");
 });
 
+test("normalizeRemoteUrl folds path case only on hosts that ignore it", () => {
+    assert.notEqual(normalizeRemoteUrl("ssh://git@host.example/srv/Repo.git"), normalizeRemoteUrl("ssh://git@host.example/srv/repo.git"),
+        "a self-hosted server can have two repositories that differ only in case");
+    assert.equal(normalizeRemoteUrl("https://HOST.Example:8443/srv/Repo"), "host.example:8443/srv/Repo", "the host is always folded");
+    assert.equal(normalizeRemoteUrl("git@GitHub.com:Owner/Repo.git"), "github.com/owner/repo");
+    assert.equal(normalizeRemoteUrl("https://contoso.ghe.com/Owner/Repo"), "contoso.ghe.com/owner/repo");
+    assert.equal(normalizeRemoteUrl("https://Contoso.VisualStudio.com/Project/_git/Repo"), "contoso.visualstudio.com/project/_git/repo");
+    assert.equal(normalizeRemoteUrl("git@ssh.dev.azure.com:v3/Contoso/Project/Repo"), "ssh.dev.azure.com/v3/contoso/project/repo");
+    assert.equal(normalizeRemoteUrl("https://notgithub.com/Owner/Repo"), "notgithub.com/Owner/Repo");
+});
+
 test("pathKey folds case only where the file system usually does", () => {
     assert.equal(pathKey("/Work/Repo", "linux"), "/Work/Repo");
     assert.equal(pathKey("C:\\Work\\Repo", "win32"), "c:\\work\\repo");

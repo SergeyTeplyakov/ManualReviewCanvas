@@ -120,8 +120,9 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     const pathspec = buildPathspec(paths, exclude);
 
     // Explicit prefixes keep the a/ and b/ headers the parser expects, whatever diff.noprefix or diff.mnemonicPrefix say.
+    // --no-textconv keeps hunks in the file's real content, which anchors and agent edits use.
     const diff = await runGit(repoRoot, [
-        "diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
     const files = parseUnifiedDiff(diff.stdout);
     const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
@@ -136,7 +137,8 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
             });
             if (!entry) continue;
             files.push(entry);
-            hash.update("\0untracked\0").update(rel).update("\0").update(JSON.stringify(entry.hunks));
+            // The whole entry, not only its hunks: an empty, binary, or oversized file all have no hunks.
+            hash.update("\0untracked\0").update(rel).update("\0").update(JSON.stringify(entry));
         }
     }
     files.sort((a, b) => a.path.localeCompare(b.path));

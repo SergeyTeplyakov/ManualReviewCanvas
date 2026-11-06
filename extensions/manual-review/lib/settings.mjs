@@ -27,6 +27,10 @@ export function resolveDelivery(repoMode, review) {
 
 const DEFAULT_PORTS = { http: "80", https: "443", ssh: "22", "git+ssh": "22", "ssh+git": "22", git: "9418" };
 
+// Hosts that match owner and repository names case-insensitively. Other servers may be case-sensitive,
+// so their paths keep their case and a differently cased remote is asked about separately.
+const CASE_INSENSITIVE_HOST = /^(?:(?:ssh\.)?github\.com|[^.]+\.ghe\.com|gitlab\.com|bitbucket\.org|(?:ssh\.)?dev\.azure\.com|(?:[^.]+\.)?visualstudio\.com)$/;
+
 // Reduces equivalent remote spellings (https, ssh, scp-style, credentials, default port, .git) to host/owner/repo.
 // A non-default port is kept, since it can name a different server.
 export function normalizeRemoteUrl(url) {
@@ -39,7 +43,11 @@ export function normalizeRemoteUrl(url) {
         value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/^[^@/]*@/, "");
         value = value.replace(/^([^/:]+):(\d+)(?=\/|$)/, (all, host, port) => (DEFAULT_PORTS[scheme] === port ? host : all));
     }
-    return value.replace(/\.git\/*$/i, "").replace(/\/+$/, "").toLowerCase();
+    value = value.replace(/\.git\/*$/i, "").replace(/\/+$/, "");
+    const slash = value.indexOf("/");
+    const host = (slash < 0 ? value : value.slice(0, slash)).toLowerCase();
+    const rest = slash < 0 ? "" : value.slice(slash);
+    return host + (CASE_INSENSITIVE_HOST.test(host.replace(/:\d+$/, "")) ? rest.toLowerCase() : rest);
 }
 
 // Case-insensitive file systems (the Windows and macOS defaults) fold a path's case; others keep it.

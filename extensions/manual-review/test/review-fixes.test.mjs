@@ -344,3 +344,75 @@ test("a comment claimed by a provider that stopped can be resent, and live claim
     assert.equal(sent.length, 1);
     assert.equal((await delivery(orphan)).state, "queued");
 });
+
+test("a comment whose turn ends before send() returns settles instead of staying processing", async (t) => {
+    const { repo, service } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const early = await service.createThread(id, { kind: "overview", body: "Answered before send returned" });
+    const running = await service.createThread(id, { kind: "overview", body: "Still running when send returned" });
+    const state = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery.state;
+    let finishTurn = false;
+    const delivery = new Delivery({ service, send: async () => {
+        const sessionMessageId = finishTurn ? "sm-early" : "sm-running";
+        // The turn starts, with no marker the provider can match, before send() resolves.
+        await delivery.onUserMessage({ data: { messageId: sessionMessageId } });
+        if (finishTurn) await delivery.onIdle();
+        return sessionMessageId;
+    } });
+
+    finishTurn = true;
+    assert.equal((await delivery.deliver(id, early.thread.threadId, early.message.messageId, "inst")).delivered, true);
+    assert.equal(await state(early), "no-reply", "a finished turn is not reported as still running");
+
+    finishTurn = false;
+    await delivery.deliver(id, running.thread.threadId, running.message.messageId, "inst");
+    assert.equal(await state(running), "processing");
+    await delivery.onIdle();
+    assert.equal(await state(running), "no-reply");
+    assert.equal(delivery.seenSessionMessageIds.size, 0);
+});
+
+test("unquoted diff headers split at the matching side when a path contains ' b/'", async (t) => {
+    const [binary] = parseUnifiedDiff("diff --git a/x b/y.bin b/x b/y.bin\nindex 1111111..2222222 100644\nBinary files a/x b/y.bin and b/x b/y.bin differ\n");
+    assert.deepEqual([binary.oldPath, binary.path, binary.binary], ["x b/y.bin", "x b/y.bin", true]);
+    const [mode] = parseUnifiedDiff("diff --git a/dir b/file b/dir b/file\nold mode 100644\nnew mode 100755\n");
+    assert.deepEqual([mode.oldPath, mode.path], ["dir b/file", "dir b/file"]);
+
+    const { repo } = await fixture(t);
+    await mkdir(path.join(repo, "x b"));
+    await writeFile(path.join(repo, "x b", "y.bin"), Buffer.from([0, 1, 2]));
+    await git(repo, "add", "x b/y.bin");
+    await git(repo, "commit", "-q", "-m", "binary");
+    await writeFile(path.join(repo, "x b", "y.bin"), Buffer.from([0, 1, 3]));
+    const snapshot = await captureSnapshot({ repoRoot: repo, base: "HEAD", scope: "pending" });
+    const file = snapshot.files.find((f) => f.binary);
+    assert.deepEqual([file?.oldPath, file?.path], ["x b/y.bin", "x b/y.bin"]);
+});
+
+test("snapshots show a file's real content even when a textconv driver is configured", async (t) => {
+    const { dir, repo } = await fixture(t);
+    const script = path.join(dir, "upper.mjs");
+    await writeFile(script, 'import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(process.argv[2], "utf8").toUpperCase());\n');
+    const slash = (p) => p.replaceAll("\\", "/");
+    await git(repo, "config", "diff.upper.textconv", `"${slash(process.execPath)}" "${slash(script)}"`);
+    await writeFile(path.join(repo, ".git", "info", "attributes"), "*.txt diff=upper\n");
+    assert.match((await git(repo, "diff", "main")).stdout, /LINE 5 EDITED/, "the driver is active for a plain git diff");
+
+    const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
+    const rows = snapshot.files.find((f) => f.path === "a.txt").hunks.flatMap((h) => h.rows);
+    assert.ok(rows.some((r) => r.t === "add" && r.s === "line 5 edited"));
+    assert.ok(!rows.some((r) => /LINE/.test(r.s)));
+});
+
+test("the snapshot fingerprint changes when an untracked file becomes binary or too large", async (t) => {
+    const { repo } = await fixture(t);
+    const file = path.join(repo, "new.dat");
+    const fingerprint = async () => (await captureSnapshot({ repoRoot: repo, base: "main" })).fingerprint;
+    await writeFile(file, "");
+    const empty = await fingerprint();
+    await writeFile(file, Buffer.from([0, 1, 2]));
+    const binary = await fingerprint();
+    await writeFile(file, Buffer.alloc(2 * 1024 * 1024 + 1, 0x61));
+    const tooLarge = await fingerprint();
+    assert.equal(new Set([empty, binary, tooLarge]).size, 3);
+});

@@ -1446,8 +1446,10 @@ async function onClick(e) {
                 const mode = target.dataset.mode;
                 const res = await api("POST", "delivery", { mode });
                 await loadState();
-                toast(mode === "immediate"
-                    ? (res?.submitted ? `Sending each comment now. Sent ${res.submitted} waiting ${res.submitted === 1 ? "draft" : "drafts"}.` : "Sending each comment now")
+                const drafts = `${res?.submitted} waiting ${res?.submitted === 1 ? "draft" : "drafts"}`;
+                if (res?.error) toast(`Sending each comment now, but ${drafts} could not be sent: ${res.error}`, true);
+                else toast(mode === "immediate"
+                    ? (res?.submitted ? `Sending each comment now. Sent ${drafts}.` : "Sending each comment now")
                     : "Batching comments. Submit the review when you are done.");
                 break;
             }

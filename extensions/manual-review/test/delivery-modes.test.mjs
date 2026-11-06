@@ -380,6 +380,23 @@ test("in ask mode comments wait as drafts until the reviewer chooses how this re
     });
 });
 
+test("choosing immediate reports held drafts that could not be sent", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    await settings.update(repo, { delivery: "ask" });
+    const { sent, delivery } = recorder(service, { fail: true });
+    const reviewId = await openReview(service);
+
+    await withServer({ instanceId: "inst-ask-fail", getReviewId: () => reviewId, service, delivery, settings }, async ({ post }) => {
+        const held = await post("/api/threads", { kind: "file", path: "a.cs", body: "Held while undecided" });
+        const chosen = await post("/api/delivery", { mode: "immediate" });
+        assert.equal(chosen.status, 200, "the mode is saved even though sending failed");
+        assert.deepEqual(chosen.json, { mode: "immediate", submitted: 1, error: "session closed" });
+        assert.equal(sent.length, 0);
+        assert.equal(await stateOf(service, reviewId, held.json.messageId), "failed", "the draft can be resent");
+    });
+});
+
 test("without a delivery setting every comment is sent immediately unless the reviewer holds it", async () => {
     const { store, service } = fresh();
     const { sent, delivery } = recorder(service);
