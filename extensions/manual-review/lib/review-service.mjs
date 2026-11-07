@@ -547,39 +547,42 @@ export class ReviewService extends EventEmitter {
         return { anchor, location: { revisionId: rev, path: filePath, side: s, startLine, endLine: end, state: "current" } };
     }
 
-    async createThread(reviewId, input) {
+    async buildThread(review, input) {
         const kind = input.kind ?? "line";
         if (!THREAD_KINDS.includes(kind)) throw invalid(`kind must be one of ${THREAD_KINDS.join(", ")}.`);
         const author = input.author === "agent" ? "agent" : "user";
         const body = checkBody(input.body);
+        const { anchor, location } = await this.buildAnchor(review, { ...input, kind });
+        const message = {
+            messageId: `m-${randomUUID()}`,
+            author,
+            body,
+            createdAt: nowIso(),
+            clientRequestId: input.clientRequestId ?? null,
+            ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
+            ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
+        };
+        const thread = {
+            threadId: `t-${randomUUID().slice(0, 8)}`,
+            kind,
+            status: "active",
+            author,
+            createdAt: nowIso(),
+            anchor,
+            location,
+            messages: [message],
+        };
+        return { thread, message };
+    }
 
+    async createThread(reviewId, input) {
         const result = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const dup = findDuplicate(review, input.clientRequestId);
             if (dup) return { write: false, value: { thread: dup.thread, message: dup.message, duplicate: true } };
-
-            const { anchor, location } = await this.buildAnchor(review, { ...input, kind });
-            const message = {
-                messageId: `m-${randomUUID()}`,
-                author,
-                body,
-                createdAt: nowIso(),
-                clientRequestId: input.clientRequestId ?? null,
-                ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
-                ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
-            };
-            const thread = {
-                threadId: `t-${randomUUID().slice(0, 8)}`,
-                kind,
-                status: "active",
-                author,
-                createdAt: nowIso(),
-                anchor,
-                location,
-                messages: [message],
-            };
+            const { thread, message } = await this.buildThread(review, input);
             review.threads.push(thread);
-            if (location && location.revisionId !== review.currentRevisionId) {
+            if (thread.location && thread.location.revisionId !== review.currentRevisionId) {
                 await this.relocateThreads(review, review.currentRevisionId, review.git?.baseCommit);
             }
             return { review, value: { thread, message, duplicate: false } };
@@ -893,6 +896,7 @@ export class ReviewService extends EventEmitter {
             threads: threads.map((t) => ({
                 threadId: t.threadId,
                 kind: t.kind,
+                agentReview: t.agentReview,
                 status: t.status,
                 location: t.location,
                 originalLocation: t.anchor ? { revisionId: t.anchor.revisionId, path: t.anchor.path, side: t.anchor.side, startLine: t.anchor.startLine, endLine: t.anchor.endLine } : null,

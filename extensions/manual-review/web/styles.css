@@ -130,6 +130,15 @@ select {
 }
 
 .muted { color: var(--mr-muted); }
+.review-field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.review-field input, .review-field textarea { background: var(--mr-bg); border: 1px solid var(--mr-border); border-radius: var(--mr-radius); padding: 6px; }
+.review-field textarea { resize: vertical; }
+.finding-actions { display: flex; gap: 8px; padding: 8px 12px; }
+.finding-evidence { padding: 8px 12px; border-top: 1px solid var(--mr-border); }
+.finding-evidence dt { margin-top: 8px; font-weight: 600; }
+.finding-evidence dd { margin: 4px 0; overflow-wrap: anywhere; }
+.agent-review-run { padding: 12px; margin-bottom: 8px; }
+.review-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
 .mono { font-family: var(--mr-mono); }
 
 #top {
@@ -552,6 +561,7 @@ table.lessons-table th { color: var(--mr-muted); font-weight: 600; font-size: 0.
 }
 .modal h2 { margin: 0 0 4px; }
 .modal p { margin: 0 0 12px; }
+.modal a { color: var(--mr-accent); }
 .choices { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: 0 0 12px; padding: 0; border: none; }
 /* Floating the legend makes it an ordinary flex item, so the fieldset gap spaces it like the choices. */
 .choices legend { float: left; width: 100%; padding: 0; font-weight: 600; }

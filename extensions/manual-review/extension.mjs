@@ -9,6 +9,7 @@ import { Store } from "./lib/store.mjs";
 import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
+import { AgentReview, REVIEW_FOCUSES, FINDING_ASSESSMENTS, FINDING_SEVERITIES, EVIDENCE_FIELDS } from "./lib/agent-review.mjs";
 import { startReviewServer } from "./lib/server.mjs";
 
 const CANVAS_ID = "manual-review";
@@ -39,10 +40,12 @@ const delivery = new Delivery({
     learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
     sessionId: () => session?.sessionId,
 });
+const agentReview = new AgentReview({ service, send: (options) => session.send(options), sessionId: () => session?.sessionId, log });
 
 // Comments a stopped provider claimed but never sent become failed so the reviewer can resend them.
 function recoverClaims(reviewId) {
     service.recoverAbandonedClaims(reviewId).catch((err) => log(`manual-review: claim recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
+    agentReview.recover(reviewId).catch((err) => log(`manual-review: review recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
 }
 
 function toCanvasError(err) {
@@ -85,6 +88,7 @@ async function ensureServer(instanceId, reviewId) {
             },
             service,
             delivery,
+            agentReview,
             settings,
             webRoot: WEB_ROOT,
             log,
@@ -157,6 +161,88 @@ function requireString(input, name) {
 const reviewIdProp = { type: "string", description: "Review id. Defaults to the review shown in this canvas instance." };
 
 const actions = [
+    {
+        name: "run_agent_review",
+        description: "Only on an explicit user request, queue a read-only review by the exact selected models. May consume credits. Read get_review for revisionId first; results become suggestions, never automatic edits.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                reviewId: reviewIdProp,
+                revisionId: { type: "string" },
+                models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
+                focus: { type: "string", enum: REVIEW_FOCUSES },
+                intent: { type: "string", maxLength: 4000, description: "Optional goal, acceptance criteria, spec references, or review guidance; not permission to edit." },
+            },
+            required: ["models", "focus", "revisionId"],
+            additionalProperties: false,
+        },
+        handler: guarded(async (ctx) => {
+            const input = inputOf(ctx);
+            return agentReview.start(await reviewIdFor(ctx, input), input, ctx.instanceId);
+        }),
+    },
+    {
+        name: "get_agent_review",
+        description: "Read pinned review input and base/head commits. Omit path for inventory; pass path and hunkIndex for each hunk, or side old/new and optional startLine for 400 full-file lines. Follow content.nextStartLine; unavailable content is a verification limit. Excludes held drafts.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                reviewId: reviewIdProp, runId: { type: "string" }, path: { type: "string" }, hunkIndex: { type: "integer", minimum: 0 },
+                side: { type: "string", enum: ["old", "new"] }, startLine: { type: "integer", minimum: 1 },
+            },
+            required: ["runId"],
+            additionalProperties: false,
+        },
+        handler: guarded(async (ctx) => {
+            const input = inputOf(ctx);
+            return agentReview.input(await reviewIdFor(ctx, input), input);
+        }),
+    },
+    {
+        name: "report_agent_review",
+        description: "Report a selected model's actual findings after the owning conversation checks the code and baseline. Include assessments, evidence, and a summary of actual coverage/verification/limits (even with no findings), or error on failure. Only confirmed actionable findings can be approved.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                reviewId: reviewIdProp, runId: { type: "string" }, model: { type: "string" },
+                error: { type: "string", minLength: 1, maxLength: 4000 },
+                summary: { type: "string", minLength: 1, maxLength: 4000, description: "Actual coverage, skills used, checks performed, and verification limits. Required with findings, including an empty array." },
+                findings: {
+                    type: "array", maxItems: 20,
+                    items: {
+                        type: "object",
+                        properties: {
+                            kind: { type: "string", enum: ["overview", "file", "line"] },
+                            category: { type: "string", enum: ["issue", "simplification"] },
+                            severity: { type: "string", enum: FINDING_SEVERITIES },
+                            assessment: { type: "string", enum: FINDING_ASSESSMENTS },
+                            evidence: {
+                                type: "object",
+                                properties: Object.fromEntries(EVIDENCE_FIELDS.map((key) => [key, { type: "string", minLength: 1, maxLength: 2000 }])),
+                                required: EVIDENCE_FIELDS,
+                                additionalProperties: false,
+                            },
+                            body: { type: "string", minLength: 1, maxLength: 8000 },
+                            path: { type: "string" }, side: { type: "string", enum: ["old", "new"] },
+                            startLine: { type: "integer", minimum: 1 }, endLine: { type: "integer", minimum: 1 },
+                        },
+                        required: ["kind", "category", "severity", "assessment", "evidence", "body"],
+                        additionalProperties: false,
+                    },
+                },
+            },
+            required: ["runId", "model"],
+            oneOf: [
+                { required: ["findings", "summary"], not: { required: ["error"] } },
+                { required: ["error"], not: { anyOf: [{ required: ["findings"] }, { required: ["summary"] }] } },
+            ],
+            additionalProperties: false,
+        },
+        handler: guarded(async (ctx) => {
+            const input = inputOf(ctx);
+            return agentReview.report(await reviewIdFor(ctx, input), input);
+        }),
+    },
     {
         name: "update_description",
         description: "Revise the local PR-style Overview description. Read get_review first and pass its description.version (0 if absent). Does not publish to a PR.",
