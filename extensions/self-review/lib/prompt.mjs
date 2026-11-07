@@ -9,7 +9,7 @@ const MAX_THREAD_LESSONS = 10;
 const MAX_LESSON_CHARS = 300;
 
 export function marker(reviewId, messageId) {
-    return `mr:${reviewId}:${messageId}`;
+    return `sr:${reviewId}:${messageId}`;
 }
 
 function fence(text, lang = "") {
@@ -205,7 +205,7 @@ function threadContext(lines, { review, thread, message, excerpt, selected, hist
 }
 
 function reopenLine(instanceId, reviewId) {
-    return "   If the canvas panel is closed, first reopen it with `open_canvas` { canvasId: \"manual-review\", instanceId: \"" + instanceId + "\", input: { reviewId: \"" + reviewId + "\" } }.";
+    return "   If the canvas panel is closed, first reopen it with `open_canvas` { canvasId: \"self-review\", instanceId: \"" + instanceId + "\", input: { reviewId: \"" + reviewId + "\" } }.";
 }
 
 const RESOLUTION_STEP = "5. Honor the user's resolution preference, including standing personal instructions. When resolution is delegated, use set_thread_status to mark the thread resolved after replying and verifying the request is addressed. Keep unanswered, blocked, disputed, or clarification-needed work active. Outdated alone is not addressed.";
@@ -229,8 +229,8 @@ export function buildCommentPrompt({ review, thread, message, instanceId, excerp
     const personalInstructions = path.join(os.homedir(), ".copilot", "copilot-instructions.md");
     const lines = [];
 
-    lines.push(`[manual-review ${marker(review.reviewId, message.messageId)}]`);
-    lines.push(`The user posted a review comment in the manual-review canvas (instanceId \`${instanceId}\`).`);
+    lines.push(`[self-review ${marker(review.reviewId, message.messageId)}]`);
+    lines.push(`The user posted a review comment in the self-review canvas (instanceId \`${instanceId}\`).`);
     lines.push("");
     lines.push(...reviewLines(review, loc.revisionId ?? review.currentRevisionId));
     lines.push("");
@@ -275,9 +275,9 @@ export function buildBatchPrompt({ review, groups, instanceId, learning }) {
     const lines = [];
 
     for (const g of groups) {
-        for (const m of g.messages) lines.push(`[manual-review ${marker(review.reviewId, m.messageId)}]`);
+        for (const m of g.messages) lines.push(`[self-review ${marker(review.reviewId, m.messageId)}]`);
     }
-    lines.push(`The user submitted a review in the manual-review canvas (instanceId \`${instanceId}\`) with ${count} ${count === 1 ? "comment" : "comments"} in ${groups.length} ${groups.length === 1 ? "thread" : "threads"}. Address every thread below.`);
+    lines.push(`The user submitted a review in the self-review canvas (instanceId \`${instanceId}\`) with ${count} ${count === 1 ? "comment" : "comments"} in ${groups.length} ${groups.length === 1 ? "thread" : "threads"}. Address every thread below.`);
     lines.push("");
     lines.push(...reviewLines(review, review.currentRevisionId));
 

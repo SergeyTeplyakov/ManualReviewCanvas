@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 
-const MARKER_RE = /^\[manual-review mr:([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
+// Also accepts markers written before the rename to Self Review Canvas, so in-flight replies still match.
+const MARKER_RE = /^\[(?:self-review sr|manual-review mr):([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
 
 const nowIso = () => new Date().toISOString();
 
@@ -65,7 +66,7 @@ export class Delivery extends EventEmitter {
         try {
             return await this.learning(repoRoot);
         } catch (err) {
-            this.log(`manual-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+            this.log(`self-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
             return "off";
         }
     }
@@ -96,7 +97,7 @@ export class Delivery extends EventEmitter {
             sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue" });
         } catch (err) {
             const error = String(err?.message ?? err);
-            this.log(`manual-review: failed to deliver ${claims.map((c) => c.messageId).join(", ")}: ${error}`, "warning");
+            this.log(`self-review: failed to deliver ${claims.map((c) => c.messageId).join(", ")}: ${error}`, "warning");
             for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, { state: "failed", error }, c);
             return { delivered: false, error };
         }
@@ -193,7 +194,7 @@ export class Delivery extends EventEmitter {
                 await this.service.settleProcessing(reviewId, { sessionId: this.owner() });
                 await this.service.recoverAbandonedClaims(reviewId);
             } catch (err) {
-                this.log(`manual-review: settle failed for ${reviewId}: ${err?.message ?? err}`, "warning");
+                this.log(`self-review: settle failed for ${reviewId}: ${err?.message ?? err}`, "warning");
             }
         }
     }

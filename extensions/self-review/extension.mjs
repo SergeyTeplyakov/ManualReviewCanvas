@@ -1,18 +1,18 @@
-// Extension: manual-review
+// Extension: self-review
 // PR-style inline review of local git changes. Comments are delivered to the agent as
 // conversation messages; the agent answers in-thread with the `reply` action and, depending on the
 // repository's learning mode, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
-import { Store } from "./lib/store.mjs";
+import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
 import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
 import { AgentReview, REVIEW_FOCUSES, FINDING_ASSESSMENTS, FINDING_SEVERITIES, EVIDENCE_FIELDS } from "./lib/agent-review.mjs";
 import { startReviewServer } from "./lib/server.mjs";
 
-const CANVAS_ID = "manual-review";
+const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
 const REPO_FIELDS = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context"];
 
@@ -44,8 +44,8 @@ const agentReview = new AgentReview({ service, send: (options) => session.send(o
 
 // Comments a stopped provider claimed but never sent become failed so the reviewer can resend them.
 function recoverClaims(reviewId) {
-    service.recoverAbandonedClaims(reviewId).catch((err) => log(`manual-review: claim recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
-    agentReview.recover(reviewId).catch((err) => log(`manual-review: review recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
+    service.recoverAbandonedClaims(reviewId).catch((err) => log(`self-review: claim recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
+    agentReview.recover(reviewId).catch((err) => log(`self-review: review recovery failed for ${reviewId}: ${err?.message ?? err}`, "warning"));
 }
 
 function toCanvasError(err) {
@@ -149,7 +149,7 @@ async function closeInstance(ctx) {
         await entry.ready;
         await entry.server?.close();
     } catch (err) {
-        log(`manual-review: failed to close ${ctx.instanceId}: ${err?.message ?? err}`, "warning");
+        log(`self-review: failed to close ${ctx.instanceId}: ${err?.message ?? err}`, "warning");
     }
 }
 
@@ -329,7 +329,7 @@ const actions = [
                 try {
                     revision = await service.refresh(reviewId);
                 } catch (err) {
-                    log(`manual-review: refresh after reply failed: ${err?.message ?? err}`, "warning");
+                    log(`self-review: refresh after reply failed: ${err?.message ?? err}`, "warning");
                 }
             }
             return { ok: true, reviewId, threadId, messageId: message.messageId, revision };
@@ -391,11 +391,14 @@ const actions = [
     },
 ];
 
+// Must finish before the store is first used; joinSession is what makes the store reachable.
+const migration = await migrateLegacyDataRoot().then((copied) => ({ copied }), (error) => ({ error }));
+
 session = await joinSession({
     canvases: [
         createCanvas({
             id: CANVAS_ID,
-            displayName: "Manual review",
+            displayName: "Self review",
             description: "PR-style inline review of local git changes (the whole branch or only pending changes) with threaded discussion delivered to the agent.",
             inputSchema: {
                 type: "object",
@@ -419,18 +422,21 @@ session = await joinSession({
     ],
 });
 
+if (migration.copied) log("self-review: copied review data from the Manual Review Canvas location.");
+if (migration.error) log(`self-review: could not copy review data from the Manual Review Canvas location: ${migration.error?.message ?? migration.error}`, "warning");
+
 session.on("user.message", (event) => {
-    delivery.onUserMessage(event).catch((err) => log(`manual-review: user.message handling failed: ${err?.message ?? err}`, "warning"));
+    delivery.onUserMessage(event).catch((err) => log(`self-review: user.message handling failed: ${err?.message ?? err}`, "warning"));
 });
 session.on("assistant.turn_start", () => delivery.setBusy(true));
 
 let refreshTimer = null;
 session.on("session.idle", () => {
-    delivery.onIdle().catch((err) => log(`manual-review: idle handling failed: ${err?.message ?? err}`, "warning"));
+    delivery.onIdle().catch((err) => log(`self-review: idle handling failed: ${err?.message ?? err}`, "warning"));
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
         for (const reviewId of openReviewIds()) {
-            service.refresh(reviewId).catch((err) => log(`manual-review: refresh of ${reviewId} failed: ${err?.message ?? err}`, "warning"));
+            service.refresh(reviewId).catch((err) => log(`self-review: refresh of ${reviewId} failed: ${err?.message ?? err}`, "warning"));
         }
     }, 500);
 });

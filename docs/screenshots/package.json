@@ -1,5 +1,5 @@
 {
-  "name": "manual-review-canvas-screenshots",
+  "name": "self-review-canvas-screenshots",
   "private": true,
   "type": "module",
   "description": "Renders the README screenshots from a scripted demo review.",

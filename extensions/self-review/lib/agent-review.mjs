@@ -139,7 +139,7 @@ export class AgentReview {
                 }
                 return { review };
             });
-            this.log(`manual-review: could not send agent review ${run.runId}: ${err?.message ?? err}`, "warning");
+            this.log(`self-review: could not send agent review ${run.runId}: ${err?.message ?? err}`, "warning");
             throw err;
         } finally {
             this.service.changed(reviewId, "agent-review");

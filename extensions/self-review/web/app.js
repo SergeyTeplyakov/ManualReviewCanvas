@@ -1,4 +1,4 @@
-// Manual review canvas client: renders the diff, inline threads, and composers; talks to the
+// Self review canvas client: renders the diff, inline threads, and composers; talks to the
 // per-instance loopback server with the token from the URL.
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
 const STATUSES = ["active", "resolved", "wontfix", "closed"];
@@ -444,7 +444,7 @@ function connect() {
 
 // ---------- Drafts & view persistence ----------
 
-const draftKey = (key) => `mr:${state.review?.reviewId}:draft:${key}`;
+const draftKey = (key) => `sr:${state.review?.reviewId}:draft:${key}`;
 const getDraft = (key) => localStorage.getItem(draftKey(key)) ?? "";
 function setDraft(key, value) {
     if (value) localStorage.setItem(draftKey(key), value);
@@ -452,14 +452,14 @@ function setDraft(key, value) {
 }
 
 function saveView() {
-    if (state.review) sessionStorage.setItem(`mr:${state.review.reviewId}:view`, JSON.stringify(state.view));
+    if (state.review) sessionStorage.setItem(`sr:${state.review.reviewId}:view`, JSON.stringify(state.view));
 }
 let viewRestored = false;
 function restoreView() {
     if (viewRestored || !state.review) return;
     viewRestored = true;
     try {
-        const v = JSON.parse(sessionStorage.getItem(`mr:${state.review.reviewId}:view`) ?? "null");
+        const v = JSON.parse(sessionStorage.getItem(`sr:${state.review.reviewId}:view`) ?? "null");
         if (v?.type) state.view = v;
     } catch { /* ignore */ }
 }
@@ -467,7 +467,7 @@ function restoreView() {
 function collapsedDirs() {
     if (!state.collapsedDirs) {
         try {
-            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`mr:${state.review?.reviewId}:collapsed`) ?? "[]"));
+            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`sr:${state.review?.reviewId}:collapsed`) ?? "[]"));
         } catch {
             state.collapsedDirs = new Set();
         }
@@ -478,7 +478,7 @@ function setDirCollapsed(dir, collapsed) {
     const set = collapsedDirs();
     if (collapsed) set.add(dir);
     else set.delete(dir);
-    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
+    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
 }
 function expandAncestors(path) {
     for (const dir of collapsedDirs()) {
@@ -985,7 +985,7 @@ function setAllDirsCollapsed(collapse) {
     };
     if (collapse) walk(buildTree(state.snapshot?.files ?? []));
     state.collapsedDirs = new Set(dirs);
-    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
+    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
 }
 
 function descriptionHtml() {

@@ -1,9 +1,9 @@
 ---
-name: manual-review
-description: "Human-led review of local Git changes in a PR-style diff canvas with persistent threads, agent fixes, opt-in multi-model review and simplification, and optional review-derived guidelines. USE FOR: manual review, review canvas, walk through changes, review pending changes, comment on diff, inline diff comments, local PR-style review, multi-model canvas review."
+name: self-review
+description: "Human-led review of local Git changes in a PR-style diff canvas with persistent threads, agent fixes, opt-in multi-model review and simplification, and optional review-derived guidelines. USE FOR: self review, manual review, review canvas, walk through changes, review pending changes, comment on diff, inline diff comments, local PR-style review, multi-model canvas review."
 ---
 
-# Manual review
+# Self review
 
 An action-loop skill for reviewing changes together. The human chooses what to
 discuss or fix; the agent preserves the review context and responds in the same
@@ -15,13 +15,13 @@ discuss; they never authorize automatic fixes.
 - Use the current repository and conversation. Do not create a worktree or switch
   branches merely to start a review.
 - The canvas extension ships in the same plugin as this skill, in
-  `extensions/manual-review/`. If it is missing from the canvas catalog, the plugin
+  `extensions/self-review/`. If it is missing from the canvas catalog, the plugin
   is not installed or the session started before it was installed. Tell the user
   how to install it and run nothing without their confirmation:
-  `copilot plugin marketplace add SergeyTeplyakov/ManualReviewCanvas`, then
-  `copilot plugin install manual-review-canvas@manual-review-canvas`, then start a
+  `copilot plugin marketplace add SergeyTeplyakov/SelfReviewCanvas`, then
+  `copilot plugin install self-review-canvas@self-review-canvas`, then start a
   new session.
-- Inspect the live canvas catalog for the manual-review extension. Discover its
+- Inspect the live canvas catalog for the self-review extension. Discover its
   actual input and action schemas before calling it; this skill does not register
   a canvas or define tool signatures.
 - If the extension is missing and the user wants it created, invoke create-canvas

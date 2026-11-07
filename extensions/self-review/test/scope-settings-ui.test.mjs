@@ -597,7 +597,7 @@ test("switching scope loads the other review, remembers each review's own view, 
 
     app.run('navigate({ type: "file", path: "src/a.cs" })');
     app.run('state.open.add("line:src/a.cs:new:5-5"); state.expanded.add("t1"); state.fileFold.set("src/a.cs", true); state.content.set("ra:src/a.cs", {}); state.pendingJump = "t1"; collapsedDirs();');
-    app.sessionStorage.items.set("mr:b:view", JSON.stringify({ type: "lessons" }));
+    app.sessionStorage.items.set("sr:b:view", JSON.stringify({ type: "lessons" }));
 
     await click("scope", { scope: "pending" });
     assert.deepEqual(calls.slice(-3), ["POST /api/scope", "GET /api/state", "GET /api/snapshot/rb"]);

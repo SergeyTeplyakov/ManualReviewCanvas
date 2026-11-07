@@ -126,14 +126,14 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }, ASSET_DEBOUNCE_MS);
             assetTimer.unref?.();
         });
-        watcher.on("error", (err) => log(`manual-review: asset watcher stopped: ${err?.message ?? err}`, "warning"));
+        watcher.on("error", (err) => log(`self-review: asset watcher stopped: ${err?.message ?? err}`, "warning"));
     } catch (err) {
-        log(`manual-review: asset watcher unavailable: ${err?.message ?? err}`, "warning");
+        log(`self-review: asset watcher unavailable: ${err?.message ?? err}`, "warning");
     }
 
     const deliverAsync = (reviewId, threadId, messageId) => {
         delivery.deliver(reviewId, threadId, messageId, instanceId).catch((err) => {
-            log(`manual-review: delivery error for ${messageId}: ${err?.message ?? err}`, "warning");
+            log(`self-review: delivery error for ${messageId}: ${err?.message ?? err}`, "warning");
             service.setDelivery(reviewId, messageId, { state: "failed", error: String(err?.message ?? err) }).catch(() => {});
         });
     };
@@ -143,7 +143,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         try {
             return await settings.get(repoRoot);
         } catch (err) {
-            log(`manual-review: could not read settings: ${err?.message ?? err}`, "warning");
+            log(`self-review: could not read settings: ${err?.message ?? err}`, "warning");
             return null;
         }
     }
@@ -299,7 +299,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         } catch (err) {
             const status = err instanceof HttpError ? err.status : STATUS_FOR_CODE[err?.code] ?? 500;
             const code = err?.code ?? "internal";
-            if (status >= 500) log(`manual-review: ${req.method} ${req.url?.split("?")[0]} failed: ${err?.message ?? err}`, "warning");
+            if (status >= 500) log(`self-review: ${req.method} ${req.url?.split("?")[0]} failed: ${err?.message ?? err}`, "warning");
             if (!res.headersSent) send(res, status, { error: { code, message: err?.message ?? String(err) } });
             else res.end();
         }

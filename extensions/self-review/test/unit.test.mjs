@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, readFile, readdir, writeFile } from "node:fs/promises";
 import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
 import { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } from "../lib/diff.mjs";
 import { relocate } from "../lib/anchors.mjs";
 import { buildCommentPrompt, marker } from "../lib/prompt.mjs";
-import { Store } from "../lib/store.mjs";
+import { Store, migrateLegacyDataRoot } from "../lib/store.mjs";
 
 const DIFF = [
     "diff --git a/src/a.cs b/src/a.cs",
@@ -116,7 +116,7 @@ test("prompt carries marker, location, fenced code and reply instructions", () =
         messages: [message],
     };
     const { prompt, displayPrompt } = buildCommentPrompt({ review, thread, message, instanceId: "inst-1", excerpt: { text: "@@ -1 +1 @@\n+x" }, selected: ["Foo(```, null);"] });
-    assert.ok(prompt.startsWith(`[manual-review ${marker("rev-1", message.messageId)}]`));
+    assert.ok(prompt.startsWith(`[self-review ${marker("rev-1", message.messageId)}]`));
     assert.match(prompt, /src\/a\.cs L5/);
     assert.match(prompt, /originally: src\/a\.cs L3 in r1/);
     assert.match(prompt, /````csharp\nFoo\(```, null\);\n````/);
@@ -406,6 +406,36 @@ test("store serializes concurrent updates and persists instance mapping", async 
         await store.setInstanceReview("inst", "r-1");
         assert.equal(await new Store(dir).getInstanceReview("inst"), "r-1");
         await assert.rejects(() => store.readReview("../escape"));
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("legacy Manual Review Canvas data is copied once without locks or temp files", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sr-migrate-"));
+    try {
+        const legacy = path.join(dir, "manual-review");
+        const root = path.join(dir, "self-review");
+        assert.equal(await migrateLegacyDataRoot(root, legacy), false, "nothing to copy");
+        const old = new Store(legacy);
+        await old.updateReview("r-1", () => ({ review: { reviewId: "r-1", n: 1 } }));
+        await old.setInstanceReview("inst", "r-1");
+        await mkdir(path.join(legacy, "locks"), { recursive: true });
+        await writeFile(path.join(legacy, "locks", "stale.lock"), "");
+        await writeFile(path.join(legacy, "reviews", "partial.json.1.x.tmp"), "");
+
+        assert.equal(await migrateLegacyDataRoot(root, legacy), true);
+        const migrated = new Store(root);
+        assert.equal((await migrated.readReview("r-1")).n, 1);
+        assert.equal(await migrated.getInstanceReview("inst"), "r-1");
+        assert.ok(!(await readdir(root)).includes("locks"));
+        assert.ok(!(await readdir(path.join(root, "reviews"))).some((name) => name.endsWith(".tmp")));
+        assert.equal((await old.readReview("r-1")).n, 1, "legacy data stays intact");
+        assert.ok(!(await readdir(dir)).some((name) => name.endsWith(".tmp")));
+
+        await migrated.updateReview("r-1", (r) => ({ review: { ...r, n: 2 } }));
+        assert.equal(await migrateLegacyDataRoot(root, legacy), false, "an existing root is never overwritten");
+        assert.equal((await migrated.readReview("r-1")).n, 2);
     } finally {
         await rm(dir, { recursive: true, force: true });
     }

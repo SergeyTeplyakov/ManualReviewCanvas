@@ -1,7 +1,7 @@
-// Durable review storage under ~/.copilot/extension-data/manual-review.
+// Durable review storage under ~/.copilot/extension-data/self-review.
 // Writes are atomic (temp file + rename) and serialized per key so concurrent
 // UI posts and agent replies cannot lose each other's updates.
-import { mkdir, open, readFile, rename, writeFile, appendFile, unlink } from "node:fs/promises";
+import { cp, mkdir, open, readFile, rename, rm, stat, writeFile, appendFile, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,50 @@ const REVISION_ID = /^r[0-9]{1,6}$/;
 const RETRYABLE = new Set(["EPERM", "EBUSY", "EACCES"]);
 
 export function defaultDataRoot() {
+    return path.join(os.homedir(), ".copilot", "extension-data", "self-review");
+}
+
+// Where releases named Manual Review Canvas kept their data.
+export function legacyDataRoot() {
     return path.join(os.homedir(), ".copilot", "extension-data", "manual-review");
+}
+
+async function exists(p) {
+    try {
+        await stat(p);
+        return true;
+    } catch (err) {
+        if (err?.code === "ENOENT") return false;
+        throw err;
+    }
+}
+
+/**
+ * Copies data from the pre-rename location once, before the store is first used. The legacy
+ * directory is left intact so a still-running older provider keeps working; its later writes are
+ * not merged. Lock and temporary files are skipped.
+ * @returns {Promise<boolean>} whether data was copied
+ */
+export async function migrateLegacyDataRoot(root = defaultDataRoot(), legacyRoot = legacyDataRoot()) {
+    if ((await exists(root)) || !(await exists(legacyRoot))) return false;
+    const tmp = `${root}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+        await mkdir(path.dirname(root), { recursive: true });
+        await cp(legacyRoot, tmp, {
+            recursive: true,
+            filter: (src) => {
+                const rel = path.relative(legacyRoot, src);
+                return rel.split(path.sep)[0] !== "locks" && !rel.endsWith(".tmp");
+            },
+        });
+        await withRetry(() => rename(tmp, root));
+        return true;
+    } catch (err) {
+        await rm(tmp, { recursive: true, force: true }).catch(() => {});
+        // Another provider finished the copy first.
+        if (await exists(root)) return false;
+        throw err;
+    }
 }
 
 export function assertReviewId(reviewId) {
@@ -94,7 +137,7 @@ export class Store {
             } catch (err) {
                 if (err?.code !== "EEXIST") throw err;
                 if (Date.now() >= deadline) {
-                    throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all manual-review providers before removing this lock.`);
+                    throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all self-review providers before removing this lock.`);
                 }
                 await sleep(25);
             }
