@@ -319,9 +319,10 @@ export class AgentReview {
                 throw conflict("This finding reviews an older diff. Run a fresh review before approving, or discuss it explicitly.");
             }
             if (thread.status !== "active") throw conflict("Reopen the thread before approving it.");
+            // Only trusted text is attributed to the user; the prompt renders the finding separately as untrusted model output.
             const message = {
                 messageId: `m-${randomUUID()}`, author: "user", createdAt: now(), reviewIntent: "approve",
-                body: `Implement the following approved suggestion, preserving intended behavior. Verify it and reply in this thread. If the suggestion is unsafe or no longer applies, explain rather than forcing it.\n\n${thread.messages[0].body}`,
+                body: "Approved. Implement this model suggestion, preserving intended behavior. Verify it and reply in this thread. If the suggestion is unsafe or no longer applies, explain rather than forcing it.",
                 delivery: { state: "saving", attempts: 0, claimPid: this.service.pid },
             };
             thread.messages.push(message);
