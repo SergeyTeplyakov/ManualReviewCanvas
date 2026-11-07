@@ -1,26 +1,27 @@
 ---
-name: manual-review
-description: "Human-led code review of local Git changes in an interactive PR-style diff canvas with persistent inline threads, agent fixes, threaded replies, and optional review-derived coding guidelines. USE FOR: manual review, review canvas, walk through changes, review pending changes, comment on diff, inline diff comments, local PR-style review."
+name: self-review
+description: "Human-led review of local Git changes in a PR-style diff canvas with persistent threads, agent fixes, opt-in multi-model review and simplification, and optional review-derived guidelines. USE FOR: self review, manual review, review canvas, walk through changes, review pending changes, comment on diff, inline diff comments, local PR-style review, multi-model canvas review."
 ---
 
-# Manual review
+# Self review
 
 An action-loop skill for reviewing changes together. The human chooses what to
 discuss or fix; the agent preserves the review context and responds in the same
-thread. This is not an autonomous code-review pipeline.
+thread. Optional agent reviews propose findings for the human to approve or
+discuss; they never authorize automatic fixes.
 
 ## Prerequisites and capability gate
 
 - Use the current repository and conversation. Do not create a worktree or switch
   branches merely to start a review.
 - The canvas extension ships in the same plugin as this skill, in
-  `extensions/manual-review/`. If it is missing from the canvas catalog, the plugin
+  `extensions/self-review/`. If it is missing from the canvas catalog, the plugin
   is not installed or the session started before it was installed. Tell the user
   how to install it and run nothing without their confirmation:
-  `copilot plugin marketplace add SergeyTeplyakov/ManualReviewCanvas`, then
-  `copilot plugin install manual-review-canvas@manual-review-canvas`, then start a
+  `copilot plugin marketplace add SergeyTeplyakov/SelfReviewCanvas`, then
+  `copilot plugin install self-review-canvas@self-review-canvas`, then start a
   new session.
-- Inspect the live canvas catalog for the manual-review extension. Discover its
+- Inspect the live canvas catalog for the self-review extension. Discover its
   actual input and action schemas before calling it; this skill does not register
   a canvas or define tool signatures.
 - If the extension is missing and the user wants it created, invoke create-canvas
@@ -65,6 +66,52 @@ thread. This is not an autonomous code-review pipeline.
    description of purpose, behavior, scope, verification, and risks. Use the
    discovered description action to revise this local draft when requested in
    the overall discussion; do not update a published PR without permission.
+
+## Run an opt-in agent review
+
+Only run agent review when the user explicitly requests it. It may consume
+credits. Use the user's exact selected model IDs and review focus; ask if they
+have not chosen models. Never substitute a different model or claim to have
+dispatched one that the host cannot select.
+
+Discover `run_agent_review`, `get_agent_review`, and `report_agent_review` from
+the live canvas schema. Start against the current review revision, with any
+user-supplied goal, acceptance criteria, spec references, or review guidance.
+Follow the queued run's read-only policy and reporting contract. Its pinned input
+includes the comparison commits, diff hunks, and paged full-file context;
+unavailable or stale content must be reported as a verification limit.
+
+The selected models review independently. The owning conversation checks their
+candidate findings against the pinned change, baseline, and relevant callers,
+guards, tests, and requirements before reporting them. Do not spawn another
+validator model. Preserve model attribution and disagreement rather than using
+agreement as a confidence score. Report the actual coverage and verification
+limits even when no findings remain.
+
+The canvas records evidence and assessments separately from thread status.
+Confirmed, actionable findings can be approved for implementation; pre-existing,
+rejected, unverified, and informational findings remain discussable. Approval is
+not proof that a suggestion is correct: recheck it before editing. Discuss opens
+conversation, not permission to fix. Use the normal posted-comment loop for
+either interaction.
+
+### Optional Addy Osmani skills
+
+You can use Addy Osmani's
+[`code-review-and-quality`](https://github.com/addyosmani/agent-skills/tree/main/skills/code-review-and-quality)
+and
+[`code-simplification`](https://github.com/addyosmani/agent-skills/tree/main/skills/code-simplification)
+skills alongside this canvas when installed and applicable. They are not bundled
+or required. Load them through the host's available skill mechanism before
+claiming to use them; report missing requested guidance and never install it
+automatically. Name the skills actually used in the review summary.
+
+The run's scope and read-only boundary still apply: no mutation tests in the
+user's checkout, automatic edits, commits, extra model dispatch, or publication.
+Repository standards take precedence over generic style heuristics.
+Simplification must preserve outputs, errors, side effects, ordering, and prose
+meaning, not merely shorten the code. A guideline from a model is not a settled
+user preference.
 
 ## Inline comment contract
 

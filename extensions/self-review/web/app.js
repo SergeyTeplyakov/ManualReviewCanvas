@@ -1,8 +1,10 @@
-// Manual review canvas client: renders the diff, inline threads, and composers; talks to the
+// Self review canvas client: renders the diff, inline threads, and composers; talks to the
 // per-instance loopback server with the token from the URL.
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
 const STATUSES = ["active", "resolved", "wontfix", "closed"];
 const STALE_QUEUE_MS = 120000;
+const FINDING_ASSESSMENTS = { confirmed: "Confirmed", "pre-existing": "Pre-existing", rejected: "Rejected", unverified: "Unverified" };
+const FINDING_SEVERITIES = { critical: "Critical", required: "Required", optional: "Optional", nit: "Nit", fyi: "FYI" };
 
 const state = {
     review: null,
@@ -23,6 +25,8 @@ const state = {
     dialog: null, // open Configure dialog: { learning, delivery, saving, error }
     switching: false, // a scope switch is in flight
     submitting: false, // a review submission is in flight
+    agentReviewAvailable: false,
+    approving: new Set(),
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
@@ -399,6 +403,7 @@ async function loadState() {
             if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
             state.settings = data.settings ?? null;
+            state.agentReviewAvailable = data.agentReviewAvailable === true;
             if (data.session) state.busy = data.session.busy;
             const rev = state.review.currentRevisionId;
             if (rev && state.snapshot?.revisionId !== rev) state.snapshot = await api("GET", `snapshot/${rev}`);
@@ -439,7 +444,7 @@ function connect() {
 
 // ---------- Drafts & view persistence ----------
 
-const draftKey = (key) => `mr:${state.review?.reviewId}:draft:${key}`;
+const draftKey = (key) => `sr:${state.review?.reviewId}:draft:${key}`;
 const getDraft = (key) => localStorage.getItem(draftKey(key)) ?? "";
 function setDraft(key, value) {
     if (value) localStorage.setItem(draftKey(key), value);
@@ -447,14 +452,14 @@ function setDraft(key, value) {
 }
 
 function saveView() {
-    if (state.review) sessionStorage.setItem(`mr:${state.review.reviewId}:view`, JSON.stringify(state.view));
+    if (state.review) sessionStorage.setItem(`sr:${state.review.reviewId}:view`, JSON.stringify(state.view));
 }
 let viewRestored = false;
 function restoreView() {
     if (viewRestored || !state.review) return;
     viewRestored = true;
     try {
-        const v = JSON.parse(sessionStorage.getItem(`mr:${state.review.reviewId}:view`) ?? "null");
+        const v = JSON.parse(sessionStorage.getItem(`sr:${state.review.reviewId}:view`) ?? "null");
         if (v?.type) state.view = v;
     } catch { /* ignore */ }
 }
@@ -462,7 +467,7 @@ function restoreView() {
 function collapsedDirs() {
     if (!state.collapsedDirs) {
         try {
-            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`mr:${state.review?.reviewId}:collapsed`) ?? "[]"));
+            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`sr:${state.review?.reviewId}:collapsed`) ?? "[]"));
         } catch {
             state.collapsedDirs = new Set();
         }
@@ -473,7 +478,7 @@ function setDirCollapsed(dir, collapsed) {
     const set = collapsedDirs();
     if (collapsed) set.add(dir);
     else set.delete(dir);
-    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
+    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
 }
 function expandAncestors(path) {
     for (const dir of collapsedDirs()) {
@@ -706,6 +711,7 @@ function renderTop() {
         parts.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Choose how Copilot receives and learns from your review feedback in this repository">Configure</button>`);
     }
     parts.push(`<button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
+    if (state.agentReviewAvailable) parts.push(`<button data-action="agent-review" title="Request independent, read-only reviews from selected models">Agent review</button>`);
     $("#top").innerHTML = parts.join("");
 }
 
@@ -749,6 +755,7 @@ function choicesHtml(name, modes, table, selected) {
 function dialogHtml() {
     const d = state.dialog;
     if (!d) return "";
+    if (d.type === "agent-review") return agentReviewDialogHtml(d);
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
@@ -782,9 +789,89 @@ function openConfigure() {
 
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving) return;
+    const opener = state.dialog.type === "agent-review" ? "agent-review" : "configure";
     state.dialog = null;
     renderDialog();
-    focusIn('[data-action="configure"]');
+    focusIn(`[data-action="${opener}"]`);
+}
+
+function agentReviewDialogHtml(d) {
+    const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
+    return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
+        + `<h2 id="dialog-title">Agent review</h2>`
+        + `<p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`
+        + `<label class="review-field">Model IDs (one to four, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
+        + `<p class="muted">Use exact model IDs available in your Copilot session. An unavailable model is reported as a failure, never silently replaced.</p>`
+        + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
+        + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
+        + `<p class="muted">The coordinating agent checks findings against the code, baseline, and relevant callers or tests before reporting them. Missing evidence is reported, not treated as a pass.</p>`
+        + `<p class="muted">You can request Addy Osmani's <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">review and code-simplification skills</a> in the guidance above if installed. They are optional; nothing is installed automatically.</p>`
+        + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
+        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button><button class="primary" data-action="agent-review-start"${d.saving ? " disabled" : ""}>${d.saving ? "Queuing..." : "Run review"}</button></div></div></div>`;
+}
+
+function openAgentReview() {
+    if (!state.agentReviewAvailable || !state.review || state.dialog) return;
+    const last = state.review.agentReviews?.at(-1);
+    state.dialog = {
+        type: "agent-review", reviewId: state.review.reviewId, revisionId: state.review.currentRevisionId,
+        scope: scopeLabel(scopeOf(state.review)), models: last?.models.join(", ") ?? "", focus: last?.focus ?? "review", intent: "", saving: false, error: "",
+    };
+    renderDialog();
+    focusIn('#dialog input[name="review-models"]');
+}
+
+async function startAgentReview() {
+    const d = state.dialog;
+    if (d?.type !== "agent-review" || d.saving) return;
+    d.saving = true;
+    d.error = "";
+    renderDialog();
+    try {
+        if (d.reviewId !== state.review?.reviewId) throw new Error("The review scope changed. Close this dialog and try again.");
+        await api("POST", "agent-reviews", { models: d.models.split(",").map((m) => m.trim()), focus: d.focus, intent: d.intent, revisionId: d.revisionId });
+        state.dialog = null;
+        renderDialog();
+        focusIn('[data-action="agent-review"]');
+        await loadState();
+        toast("Review requested. Model results will appear as suggestions.");
+    } catch (err) {
+        d.saving = false;
+        d.error = err.message;
+        if (state.dialog === d) renderDialog();
+        await loadState().catch((loadError) => toast(loadError.message, true));
+    }
+}
+
+function agentReviewsHtml() {
+    const runs = state.review?.agentReviews ?? [];
+    if (!runs.length) return "";
+    const active = (r) => ["sending", "queued", "running"].includes(r.state);
+    return `<h2>Agent reviews</h2><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
+        + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
+        + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
+        + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
+        + `<ul>${r.models.map((model) => {
+            const result = r.results.find((x) => x.model === model);
+            let outcome = active(r) ? "Awaiting result" : "Not completed";
+            if (result) {
+                if (result.error) {
+                    outcome = `Failed: ${esc(result.error)}`;
+                } else {
+                    const counts = {};
+                    for (const id of result.threadIds) {
+                        const assessment = state.review.threads.find((t) => t.threadId === id)?.agentReview?.assessment;
+                        const key = Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
+                        counts[key] = (counts[key] ?? 0) + 1;
+                    }
+                    outcome = result.threadIds.length ? Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ") : "No findings reported";
+                    outcome += `<details><summary>Coverage and verification</summary><p class="review-summary">${esc(result.summary ?? "No coverage or verification summary recorded.")}</p></details>`;
+                }
+            }
+            return `<li><span class="mono">${esc(model)}</span>: ${outcome}</li>`;
+        }).join("")}</ul>`
+        + (active(r) ? `<button data-action="agent-review-close" data-run="${esc(r.runId)}" title="Stop accepting results for this review. This does not stop agents already running.">Close review</button>` : "")
+        + `</div>`).join("")}`;
 }
 
 // A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
@@ -825,7 +912,9 @@ function trapTab(e) {
         const radios = [...document.querySelectorAll(`#dialog input[name="${name}"]`)];
         return radios.find((x) => x.checked) ?? radios[0];
     };
-    const stops = [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
+    const stops = state.dialog?.type === "agent-review"
+        ? [...document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])")]
+        : [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
     if (!stops.length) return;
     const first = stops[0];
     const last = stops[stops.length - 1];
@@ -896,7 +985,7 @@ function setAllDirsCollapsed(collapse) {
     };
     if (collapse) walk(buildTree(state.snapshot?.files ?? []));
     state.collapsedDirs = new Set(dirs);
-    localStorage.setItem(`mr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
+    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
 }
 
 function descriptionHtml() {
@@ -1021,6 +1110,23 @@ function messageHtml(m) {
         + `</div>`;
 }
 
+function findingApprovalIssue(finding) {
+    if (finding.assessment !== "confirmed") return "Only confirmed findings can be approved; discuss the assessment or run a fresh review.";
+    if (!Object.hasOwn(FINDING_SEVERITIES, finding.severity) || finding.severity === "fyi") return "This finding is not an actionable suggestion; use Discuss.";
+    if (["source", "baseline", "validation"].some((key) => typeof finding.evidence?.[key] !== "string" || !finding.evidence[key].trim())) {
+        return "Evidence is missing; run a fresh review or use Discuss.";
+    }
+    return "";
+}
+
+function findingEvidenceHtml(finding) {
+    if (!finding) return "";
+    return `<details class="finding-evidence"><summary>Evidence and verification</summary><dl>`
+        + [["source", "Source / requirement"], ["baseline", "Baseline comparison"], ["validation", "Validation / limits"]].map(([key, label]) =>
+            `<dt>${label}</dt><dd>${typeof finding.evidence?.[key] === "string" ? md(finding.evidence[key]) : "Not recorded"}</dd>`).join("")
+        + `</dl></details>`;
+}
+
 function threadHtml(t, { showLocation = false } = {}) {
     const loc = t.location ?? {};
     const outdated = loc.state === "outdated";
@@ -1032,6 +1138,8 @@ function threadHtml(t, { showLocation = false } = {}) {
     const options = STATUSES.map((s) => `<option value="${s}"${s === t.status ? " selected" : ""}>${s === "wontfix" ? "won't fix" : s}</option>`).join("");
     const head = `<div class="thread-head">`
         + `<span class="badge kind">${t.kind === "change" ? "change" : t.kind}</span>`
+        + (t.agentReview ? `<span class="badge" title="Reported reviewer model">${esc(t.agentReview.model)} / ${esc(t.agentReview.category)}</span>` : "")
+        + (t.agentReview ? `<span class="badge" title="Assessment reported by the coordinating agent">${esc(FINDING_ASSESSMENTS[t.agentReview.assessment] ?? "Unverified")}</span><span class="badge">${esc(FINDING_SEVERITIES[t.agentReview.severity] ?? "Severity not reported")}</span>` : "")
         + `<span class="loc">${showLocation ? `<button class="link" data-action="jump" data-thread="${esc(t.threadId)}">${esc(locLabel(t))}</button>` : esc(locLabel(t))}`
         + (moved ? ` <span class="muted" title="Line numbers changed since ${esc(t.anchor.revisionId)}">(originally ${esc(lineLabel(t.anchor))} in ${esc(t.anchor.revisionId)})</span>` : "")
         + `</span>`
@@ -1046,7 +1154,13 @@ function threadHtml(t, { showLocation = false } = {}) {
         ? `<div class="original muted">Originally commented code (${esc(t.anchor.revisionId)}, ${esc(lineLabel(t.anchor))}):<pre>${esc(t.anchor.selectedLines.join("\n"))}</pre></div>`
         : "";
     const reply = composerHtml(`reply:${t.threadId}`, { placeholder: "Reply…" });
-    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map(messageHtml).join("")}${reply}</div></div>`;
+    const staleFinding = t.agentReview && t.agentReview.revisionId !== state.review.currentRevisionId;
+    const approvalIssue = t.agentReview ? findingApprovalIssue(t.agentReview) : "";
+    const actions = t.agentReview
+        ? `<div class="finding-actions"><button class="primary" data-action="approve-finding" data-thread="${esc(t.threadId)}" title="${esc(staleFinding ? "Review changed; rerun before approving" : approvalIssue || "Send this suggestion to the coding agent for implementation")}"${t.agentReview.approvalMessageId || staleFinding || approvalIssue || t.status !== "active" || state.approving.has(t.threadId) ? " disabled" : ""}>${t.agentReview.approvalMessageId ? "Approved" : "Approve"}</button>`
+            + `<button data-action="discuss-finding" data-thread="${esc(t.threadId)}">Discuss</button></div>`
+        : "";
+    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}</div></div>`;
 }
 
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
@@ -1078,6 +1192,7 @@ function overviewView() {
     };
     const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
     return emptyDiffHtml()
+        + agentReviewsHtml()
         + descriptionHtml()
         + `<h2>Overall discussion</h2>`
         + (overall.length ? overall.map((t) => threadHtml(t)).join("") : `<div class="empty">No overall comments yet.</div>`)
@@ -1367,6 +1482,36 @@ async function onClick(e) {
     const { action } = target.dataset;
     try {
         switch (action) {
+            case "agent-review":
+                openAgentReview();
+                break;
+            case "agent-review-start":
+                await startAgentReview();
+                break;
+            case "agent-review-close":
+                await api("POST", `agent-reviews/${encodeURIComponent(target.dataset.run)}/close`, {});
+                await loadState();
+                break;
+            case "discuss-finding":
+                state.expanded.add(target.dataset.thread);
+                state.open.add(`reply:${target.dataset.thread}`);
+                render();
+                focusComposer(`reply:${target.dataset.thread}`);
+                break;
+            case "approve-finding": {
+                const id = target.dataset.thread;
+                if (state.approving.has(id)) break;
+                state.approving.add(id);
+                render();
+                try {
+                    const res = await api("POST", `threads/${encodeURIComponent(id)}/approve`, { revisionId: state.review.currentRevisionId });
+                    toast(res?.error ? `Approved, but delivery failed: ${res.error}. Retry in the thread.` : "Approved and sent to the coding agent", Boolean(res?.error));
+                } finally {
+                    state.approving.delete(id);
+                    await loadState();
+                }
+                break;
+            }
             case "discuss-description":
                 focusComposer("overview:new");
                 break;
@@ -1507,6 +1652,10 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
+    if (el.name === "review-focus" && state.dialog?.type === "agent-review") {
+        state.dialog.focus = el.value;
+        return;
+    }
     if ((el.name === "learning" || el.name === "delivery") && state.dialog) {
         state.dialog[el.name] = el.value;
         return;
@@ -1524,6 +1673,10 @@ async function onChange(e) {
 
 function onInput(e) {
     const el = e.target;
+    if ((el.name === "review-models" || el.name === "review-intent") && state.dialog?.type === "agent-review") {
+        state.dialog[el.name === "review-models" ? "models" : "intent"] = el.value;
+        return;
+    }
     if (el.dataset?.composer) {
         setDraft(el.dataset.composer, el.value);
         el.closest(".composer")?.classList.add("open");

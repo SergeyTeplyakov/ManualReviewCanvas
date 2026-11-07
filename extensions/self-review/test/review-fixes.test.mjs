@@ -129,7 +129,7 @@ test("an abandoned store lock fails explicitly instead of stealing ownership", {
     const lockFile = path.join(dir, "locks", `${createHash("sha256").update("settings").digest("hex")}.lock`);
     const owner = JSON.stringify({ pid: 123, key: "settings", createdAt: "2000-01-01T00:00:00Z" });
     await writeFile(lockFile, owner);
-    await assert.rejects(new Store(dir).updateSettings(() => assert.fail("must not mutate")), /stop all manual-review providers before removing this lock/);
+    await assert.rejects(new Store(dir).updateSettings(() => assert.fail("must not mutate")), /stop all self-review providers before removing this lock/);
     assert.equal(await readFile(lockFile, "utf8"), owner);
 });
 
@@ -423,7 +423,7 @@ test("quoted and forged delivery markers cannot release drafts or transfer anoth
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
     const draft = await service.createThread(id, { kind: "overview", body: "Private draft", hold: true });
     const sent = await service.createThread(id, { kind: "overview", body: "Submitted comment" });
-    const marker = (m) => `[manual-review mr:${id}:${m.message.messageId}]`;
+    const marker = (m) => `[self-review sr:${id}:${m.message.messageId}]`;
     const a = new Delivery({ service, sessionId: () => "a", send: async () => "transport-a" });
     await a.deliver(id, sent.thread.threadId, sent.message.messageId, "inst");
     const b = new Delivery({ service, sessionId: () => "b", send: async () => "transport-b" });
@@ -458,12 +458,24 @@ test("legacy queued attempts require their exact transport event to establish th
     const claim = await service.claimDelivery(id, thread.threadId, message.messageId);
     await service.setDelivery(id, message.messageId, { state: "queued", sessionMessageId: "legacy" }, claim);
     const delivery = new Delivery({ service: new ReviewService({ store }), sessionId: () => "owner", send: async () => "unused" });
-    const content = `[manual-review mr:${id}:${message.messageId}]`;
+    const content = `[self-review sr:${id}:${message.messageId}]`;
     await delivery.onUserMessage({ data: { messageId: "quoted", content } });
     assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "queued");
     await delivery.onUserMessage({ data: { messageId: "legacy", content } });
     await delivery.onIdle();
     assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "no-reply");
+});
+
+test("a provider restarted after the rename recognizes markers sent as manual-review", async (t) => {
+    const { store, service, repo } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    const { thread, message } = await service.createThread(id, { kind: "overview", body: "Sent before the rename" });
+    await new Delivery({ service, sessionId: () => "a", send: async () => "transport-a" }).deliver(id, thread.threadId, message.messageId, "inst");
+    const resumed = new Delivery({ service: new ReviewService({ store: new Store(store.root) }), sessionId: () => "a", send: async () => "unused" });
+    await resumed.onUserMessage({ data: { messageId: "transport-a", content: `[manual-review mr:${id}:${message.messageId}]` } });
+    const delivery = (await service.findMessage(id, message.messageId)).message.delivery;
+    assert.equal(delivery.state, "processing");
+    assert.equal(delivery.processedBy, "a");
 });
 
 test("idle waits for every preceding batch processing update, including delayed persistence", async (t) => {

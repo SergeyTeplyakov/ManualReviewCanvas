@@ -52,6 +52,196 @@ test("the page provides every container the scope and learning controls render i
     for (const id of ["top", "banner", "layout", "side", "main", "ruler", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
 });
 
+test("agent review is opt-in and its dialog collects models, focus, and guidance with optional Addy skills", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.run("renderTop()");
+    assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"/);
+    app.state.agentReviewAvailable = true;
+    app.run("renderTop()");
+    assert.match(app.node("#top").innerHTML, /data-action="agent-review"/);
+    const click = clicker(app);
+    await click("agent-review");
+    const d = app.state.dialog;
+    assert.equal(d.type, "agent-review");
+    assert.equal(d.models, "", "no paid model is implicitly selected");
+    assert.equal(d.intent, "");
+    assert.equal(d.revisionId, "r1");
+    assert.match(app.node("#dialog").innerHTML, /may consume credits/);
+    assert.match(app.node("#dialog").innerHTML, /No files are changed until you approve/);
+    assert.match(app.node("#dialog").innerHTML, /role="dialog".*aria-modal="true"/);
+    assert.match(app.node("#dialog").innerHTML, /Goal, spec, or review guidance \(optional\)/);
+    assert.match(app.node("#dialog").innerHTML, /github\.com\/addyosmani\/agent-skills/);
+    assert.match(app.node("#dialog").innerHTML, /nothing is installed automatically/);
+    assert.match(app.node("#dialog").innerHTML, /Missing evidence is reported, not treated as a pass/);
+    app.run("onInput")({ target: { name: "review-models", value: "model-a, model-b" } });
+    app.run("onInput")({ target: { name: "review-intent", value: "Check the documented retry boundary." } });
+    await app.run("onChange")({ target: { name: "review-focus", value: "both" } });
+    assert.equal(d.models, "model-a, model-b");
+    assert.equal(d.focus, "both");
+    assert.equal(d.intent, "Check the documented retry boundary.");
+    await click("dialog-cancel");
+    assert.equal(app.state.dialog, null);
+    assert.equal(app.focused.at(-1), '[data-action="agent-review"]');
+});
+
+test("agent review traps keyboard focus including guidance and the optional skill link while queuing", async () => {
+    const app = await loadApp();
+    app.state.dialog = { type: "agent-review", saving: false };
+    const focus = [];
+    const input = { focus: () => focus.push("models") };
+    const guidance = { focus: () => focus.push("guidance") };
+    const link = { focus: () => focus.push("skills") };
+    const button = { focus: () => focus.push("run") };
+    app.document.querySelectorAll = (selector) => {
+        assert.match(selector, /#dialog textarea:not\(\[disabled\]\)/);
+        assert.match(selector, /#dialog a\[href\]/);
+        return app.state.dialog.saving ? [link] : [input, guidance, link, button];
+    };
+    let prevented = 0;
+    const press = (shiftKey) => app.run("trapTab")({ shiftKey, preventDefault: () => prevented++ });
+    app.document.activeElement = input;
+    press(true);
+    app.document.activeElement = button;
+    press(false);
+    app.document.activeElement = guidance;
+    press(false);
+    assert.deepEqual(focus, ["run", "models"]);
+    assert.equal(prevented, 2);
+    app.state.dialog.saving = true;
+    app.document.activeElement = link;
+    press(false);
+    press(true);
+    assert.deepEqual(focus, ["run", "models", "skills", "skills"]);
+    assert.equal(prevented, 4);
+});
+
+test("agent review start sends selected models and pinned revision and preserves errors in the dialog", async () => {
+    const posts = [];
+    const app = await loadApp({
+        fetch: async (url, opts) => {
+            if (opts.method === "POST") {
+                posts.push([url, JSON.parse(opts.body)]);
+                return jsonResponse({ error: { message: "Selected model unavailable" } }, 400);
+            }
+            return jsonResponse({ review: reviewFixture(), agentReviewAvailable: true });
+        },
+    });
+    app.run("loadState = async () => {}");
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.run("openAgentReview()");
+    app.state.dialog.models = "model-a, model-b";
+    app.state.dialog.focus = "both";
+    app.state.dialog.intent = "Use Addy's skills if installed.";
+    await app.run("startAgentReview()");
+    assert.deepEqual(posts, [["/api/agent-reviews", { models: ["model-a", "model-b"], focus: "both", intent: "Use Addy's skills if installed.", revisionId: "r1" }]]);
+    assert.equal(app.state.dialog.saving, false);
+    assert.match(app.node("#dialog").innerHTML, /role="alert">Selected model unavailable/);
+    app.state.review.reviewId = "different-scope";
+    await app.run("startAgentReview()");
+    assert.equal(posts.length, 1, "an old dialog must not launch into the newly selected scope");
+    assert.match(app.state.dialog.error, /scope changed/);
+});
+
+test("agent review results distinguish findings, assessments, limits, and missing or failed model outcomes", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture({
+        agentReviews: [{
+            runId: "ar-one", state: "running", focus: "both", revisionId: "r0",
+            intent: "<goal>",
+            models: ["model-a", "<bad-model>", "model-c", "model-d"],
+            results: [
+                { model: "model-a", state: "completed", threadIds: [], summary: "<coverage>: spec unavailable; tests not run." },
+                { model: "<bad-model>", state: "failed", error: "<failed>" },
+                { model: "model-d", state: "completed", threadIds: ["t1", "t2", "t3", "t4"] },
+            ],
+        }],
+        threads: [
+            { threadId: "t1", agentReview: { assessment: "confirmed" } },
+            { threadId: "t2", agentReview: { assessment: "pre-existing" } },
+            { threadId: "t3", agentReview: { assessment: "rejected" } },
+            { threadId: "t4", agentReview: {} },
+        ],
+    });
+    const html = app.run("agentReviewsHtml()");
+    assert.match(html, /model-a<\/span>: No findings reported/);
+    assert.match(html, /&lt;bad-model&gt;<\/span>: Failed: &lt;failed&gt;/);
+    assert.match(html, /model-c<\/span>: Awaiting result/);
+    assert.match(html, /model-d<\/span>: 1 confirmed, 1 pre-existing, 1 rejected, 1 unverified/);
+    assert.match(html, /&lt;coverage&gt;: spec unavailable; tests not run/);
+    assert.match(html, /Goal \/ spec \/ guidance: &lt;goal&gt;/);
+    assert.match(html, /No coverage or verification summary recorded/);
+    assert.match(html, /older diff/);
+    assert.match(html, /does not stop agents already running/);
+    assert.doesNotMatch(html, /<bad-model>|<failed>|<coverage>|<goal>/);
+});
+
+test("model findings have Approve and Discuss controls; stale, closed, and approved findings cannot be approved again", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    const thread = {
+        threadId: "t-model", kind: "overview", status: "active", messages: [{ messageId: "m", author: "agent", body: "A suggestion", createdAt: new Date().toISOString() }],
+        agentReview: {
+            model: "<model>", category: "simplification", revisionId: "r1", assessment: "confirmed", severity: "optional",
+            evidence: { source: "source <unsafe>", baseline: "The old flow has the same behavior.", validation: "Compared side effects; no tests run." },
+        },
+    };
+    const html = () => app.run(`threadHtml(${JSON.stringify(thread)})`);
+    assert.match(html(), /&lt;model&gt; \/ simplification/);
+    assert.match(html(), /data-action="approve-finding"[^>]*>Approve/);
+    assert.match(html(), /data-action="discuss-finding"/);
+    assert.match(html(), /Agent assessment|Assessment reported by the coordinating agent/);
+    assert.match(html(), />Confirmed<\/span>/);
+    assert.match(html(), />Optional<\/span>/);
+    assert.match(html(), /Evidence and verification/);
+    assert.match(html(), /source &lt;unsafe&gt;/);
+    assert.doesNotMatch(html(), /<unsafe>/);
+    for (const assessment of ["pre-existing", "rejected", "unverified", undefined]) {
+        thread.agentReview.assessment = assessment;
+        assert.match(html(), /data-action="approve-finding"[^>]*disabled/, `${assessment} is not approvable`);
+        assert.match(html(), /data-action="discuss-finding"/);
+    }
+    thread.agentReview.assessment = "confirmed";
+    thread.agentReview.severity = "fyi";
+    assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
+    thread.agentReview.severity = "optional";
+    thread.agentReview.evidence.baseline = "";
+    assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
+    thread.agentReview.evidence.baseline = "Compared both sides.";
+    thread.agentReview.revisionId = "r0";
+    assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
+    thread.agentReview.revisionId = "r1";
+    thread.agentReview.approvalMessageId = "approved";
+    assert.match(html(), /disabled>Approved/);
+    delete thread.agentReview.approvalMessageId;
+    thread.status = "closed";
+    assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
+    delete thread.agentReview;
+    assert.doesNotMatch(html(), /approve-finding|discuss-finding/);
+});
+
+test("Discuss only opens a composer; Approve explicitly sends the finding and reports delivery failure", async () => {
+    const posts = [];
+    const app = await loadApp({
+        fetch: async (url, opts) => {
+            posts.push([url, JSON.parse(opts.body)]);
+            return jsonResponse({ error: "transport unavailable" });
+        },
+    });
+    app.run("render = () => {}; loadState = async () => {}; focusComposer = (key) => { state.focusedComposer = key; }");
+    app.state.review = reviewFixture();
+    const click = clicker(app);
+    await click("discuss-finding", { thread: "t1" });
+    assert.deepEqual(posts, [], "opening a discussion sends nothing");
+    assert.equal(app.state.open.has("reply:t1"), true);
+    assert.equal(app.state.focusedComposer, "reply:t1");
+    await click("approve-finding", { thread: "t1" });
+    assert.deepEqual(posts, [["/api/threads/t1/approve", { revisionId: "r1" }]]);
+    assert.match(app.node("#toast").textContent, /delivery failed: transport unavailable/);
+    assert.equal(app.state.approving.size, 0);
+});
+
 test("file views show mode changes and side-specific EOF notes without selectable phantom lines", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
@@ -407,7 +597,7 @@ test("switching scope loads the other review, remembers each review's own view, 
 
     app.run('navigate({ type: "file", path: "src/a.cs" })');
     app.run('state.open.add("line:src/a.cs:new:5-5"); state.expanded.add("t1"); state.fileFold.set("src/a.cs", true); state.content.set("ra:src/a.cs", {}); state.pendingJump = "t1"; collapsedDirs();');
-    app.sessionStorage.items.set("mr:b:view", JSON.stringify({ type: "lessons" }));
+    app.sessionStorage.items.set("sr:b:view", JSON.stringify({ type: "lessons" }));
 
     await click("scope", { scope: "pending" });
     assert.deepEqual(calls.slice(-3), ["POST /api/scope", "GET /api/state", "GET /api/snapshot/rb"]);

@@ -83,9 +83,10 @@ const STATUS_FOR_CODE = { invalid_input: 400, not_found: 404, conflict: 409, git
  * @param {string} p.webRoot
  * @param {(msg: string, level?: string) => void} p.log
  * @param {import("./settings.mjs").SettingsService} [p.settings] per-repository settings; the UI hides them when absent
+ * @param {import("./agent-review.mjs").AgentReview} [p.agentReview] optional multi-model review coordinator
  * @param {(reviewId: string) => Promise<void> | void} [p.onReviewChange] makes getReviewId return the new review; required to switch scope
  */
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange, agentReview }) {
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     let port = 0;
@@ -125,14 +126,14 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }, ASSET_DEBOUNCE_MS);
             assetTimer.unref?.();
         });
-        watcher.on("error", (err) => log(`manual-review: asset watcher stopped: ${err?.message ?? err}`, "warning"));
+        watcher.on("error", (err) => log(`self-review: asset watcher stopped: ${err?.message ?? err}`, "warning"));
     } catch (err) {
-        log(`manual-review: asset watcher unavailable: ${err?.message ?? err}`, "warning");
+        log(`self-review: asset watcher unavailable: ${err?.message ?? err}`, "warning");
     }
 
     const deliverAsync = (reviewId, threadId, messageId) => {
         delivery.deliver(reviewId, threadId, messageId, instanceId).catch((err) => {
-            log(`manual-review: delivery error for ${messageId}: ${err?.message ?? err}`, "warning");
+            log(`self-review: delivery error for ${messageId}: ${err?.message ?? err}`, "warning");
             service.setDelivery(reviewId, messageId, { state: "failed", error: String(err?.message ?? err) }).catch(() => {});
         });
     };
@@ -142,7 +143,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         try {
             return await settings.get(repoRoot);
         } catch (err) {
-            log(`manual-review: could not read settings: ${err?.message ?? err}`, "warning");
+            log(`self-review: could not read settings: ${err?.message ?? err}`, "warning");
             return null;
         }
     }
@@ -171,7 +172,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot) });
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), agentReviewAvailable: Boolean(agentReview) });
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
                 return send(res, 200, await service.getSnapshot(reviewId, parts[1]));
@@ -203,6 +204,19 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         const body = await readJsonBody(req);
 
+        if (parts[0] === "agent-reviews") {
+            if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");
+            if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before starting or closing an agent review.");
+            if (parts.length === 1) return send(res, 200, await agentReview.start(reviewId, body, instanceId));
+            if (parts.length === 3 && parts[2] === "close") return send(res, 200, await agentReview.close(reviewId, parts[1]));
+        }
+        if (parts[0] === "threads" && parts.length === 3 && parts[2] === "approve") {
+            if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");
+            if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before approving a finding.");
+            const approved = await agentReview.approve(reviewId, parts[1], body.revisionId);
+            const result = await delivery.deliver(reviewId, approved.threadId, approved.messageId, instanceId);
+            return send(res, 200, { ...approved, ...result });
+        }
         if (parts[0] === "threads" && parts.length === 1) {
             const hold = await shouldHold(reviewId, body.draft);
             const { thread, message, duplicate } = await service.createThread(reviewId, { ...body, author: "user", hold });
@@ -285,7 +299,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         } catch (err) {
             const status = err instanceof HttpError ? err.status : STATUS_FOR_CODE[err?.code] ?? 500;
             const code = err?.code ?? "internal";
-            if (status >= 500) log(`manual-review: ${req.method} ${req.url?.split("?")[0]} failed: ${err?.message ?? err}`, "warning");
+            if (status >= 500) log(`self-review: ${req.method} ${req.url?.split("?")[0]} failed: ${err?.message ?? err}`, "warning");
             if (!res.headersSent) send(res, status, { error: { code, message: err?.message ?? String(err) } });
             else res.end();
         }

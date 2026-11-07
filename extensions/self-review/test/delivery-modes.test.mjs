@@ -109,7 +109,7 @@ const openReview = (service) => service.ensureReview({ repoPath: repo, base: "ma
 const draftThread = (service, reviewId, filePath, body) => service.createThread(reviewId, { kind: "file", path: filePath, body, author: "user", hold: true });
 const draftReply = (service, reviewId, threadId, body) => service.addMessage(reviewId, threadId, { body, author: "user", hold: true });
 const stateOf = async (service, reviewId, messageId) => (await service.findMessage(reviewId, messageId)).message.delivery.state;
-const MARKER_LINE = /^\[manual-review mr:[^:]+:(m-[0-9a-f-]+)\]$/gm;
+const MARKER_LINE = /^\[self-review sr:[^:]+:(m-[0-9a-f-]+)\]$/gm;
 
 test("resolveDelivery uses the repository mode and lets an ask-mode review decide for itself", () => {
     assert.deepEqual(DELIVERY_MODES, ["immediate", "batch", "ask"]);
@@ -270,13 +270,13 @@ test("a single submitted draft uses the comment prompt and other drafts stay out
 
     await delivery.deliver(reviewId, first.thread.threadId, first.message.messageId, "inst");
     assert.equal(sent.length, 1);
-    assert.match(sent[0].prompt, /^\[manual-review mr:[^\]]+\]\nThe user posted a review comment/);
+    assert.match(sent[0].prompt, /^\[self-review sr:[^\]]+\]\nThe user posted a review comment/);
     assert.ok(!sent[0].prompt.includes("Still thinking about this"), "a held draft is not shown to the agent");
     assert.equal(await stateOf(service, reviewId, held.message.messageId), "draft");
 
     assert.deepEqual(await delivery.submit(reviewId, "inst"), { submitted: 1, delivered: true, sessionMessageId: "sm-2" });
-    assert.match(sent[1].prompt, /^\[manual-review mr:[^\]]+\]\nThe user posted a review comment/);
-    assert.ok(sent[1].prompt.includes(`[manual-review mr:${reviewId}:${held.message.messageId}]`));
+    assert.match(sent[1].prompt, /^\[self-review sr:[^\]]+\]\nThe user posted a review comment/);
+    assert.ok(sent[1].prompt.includes(`[self-review sr:${reviewId}:${held.message.messageId}]`));
     assert.match(sent[1].prompt, /- \*\*user:\*\* Send this one now/, "the comment sent earlier is now history");
 });
 

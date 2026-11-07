@@ -95,7 +95,7 @@ test("a line comment is delivered once with location, and the marker/messageId m
     assert.deepEqual(result, { delivered: true, sessionMessageId: "sm-1" });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].mode, "enqueue");
-    assert.match(sent[0].prompt, new RegExp(`\\[manual-review mr:${reviewId}:${lineMessage.messageId}\\]`));
+    assert.match(sent[0].prompt, new RegExp(`\\[self-review sr:${reviewId}:${lineMessage.messageId}\\]`));
     assert.match(sent[0].prompt, /a\.cs L10/);
     assert.match(sent[0].prompt, /line 10 CHANGED/);
     assert.equal(await deliveryState(lineMessage.messageId), "queued");
